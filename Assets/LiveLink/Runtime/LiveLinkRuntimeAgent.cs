@@ -13,6 +13,7 @@ namespace LiveLink
     public sealed class LiveLinkRuntimeAgent : MonoBehaviour
     {
         private static LiveLinkRuntimeAgent instance;
+        private bool transformAuthorizationGranted;
 
         [RuntimeInitializeOnLoadMethod(
             RuntimeInitializeLoadType.AfterAssembliesLoaded)]
@@ -82,11 +83,15 @@ private void OnDisable()
                 switch (cmd.type)
                 {
                     case "PING":
-                        Reply("OK", "PONG");
+                        Reply("OK", "PONG", null, cmd.requestId);
                         break;
 
                     case "MANIFEST_REQUEST":
-                        SendManifestResponse();
+                        SendManifestResponse(cmd.requestId);
+                        break;
+
+                    case "SYNC_AUTHORIZATION":
+                        AuthorizeTransforms(cmd);
                         break;
 
                     case "TRANSFORM":
@@ -104,7 +109,30 @@ private void OnDisable()
             }
         }
 
-        private void SendManifestResponse()
+        private void AuthorizeTransforms(LiveLinkCommand command)
+        {
+            LiveLinkBuildIdentity identity =
+                Resources.Load<LiveLinkBuildIdentity>(
+                    "LiveLinkBuildIdentity");
+
+            transformAuthorizationGranted =
+                identity != null &&
+                !string.IsNullOrWhiteSpace(identity.ManifestFingerprint) &&
+                string.Equals(
+                    identity.ManifestFingerprint,
+                    command.manifestFingerprint,
+                    StringComparison.OrdinalIgnoreCase);
+
+            Reply(
+                transformAuthorizationGranted ? "OK" : "ERROR",
+                transformAuthorizationGranted
+                    ? "SYNC_AUTHORIZED"
+                    : "Transform authorization fingerprint mismatch.",
+                null,
+                command.requestId);
+        }
+
+        private void SendManifestResponse(string requestId)
         {
             LiveLinkBuildIdentity identity =
                 Resources.Load<LiveLinkBuildIdentity>(
@@ -114,7 +142,9 @@ private void OnDisable()
             {
                 Reply(
                     "ERROR",
-                    "Development manifest resource is missing.");
+                    "Development manifest resource is missing.",
+                    null,
+                    requestId);
                 return;
             }
 
@@ -124,7 +154,9 @@ private void OnDisable()
             {
                 Reply(
                     "ERROR",
-                    "Development manifest resource is invalid.");
+                    "Development manifest resource is invalid.",
+                    null,
+                    requestId);
                 return;
             }
 
@@ -136,12 +168,23 @@ private void OnDisable()
                     protocolVersion = identity.ProtocolVersion,
                     fingerprint = identity.ManifestFingerprint,
                     buildName = "LiveLink"
-                });
+                },
+                requestId);
         }
 
        
-private void ApplyTransform(LiveLinkCommand cmd)
+        private void ApplyTransform(LiveLinkCommand cmd)
 {
+    if (!transformAuthorizationGranted)
+    {
+        Reply(
+            "ERROR",
+            "Transform synchronization is not authorized for this build.",
+            null,
+            cmd.requestId);
+        return;
+    }
+
     if (!LiveLinkObjectRegistry.TryGet(
         cmd.objectId, out var identity, out var error))
     {
@@ -158,19 +201,21 @@ private void ApplyTransform(LiveLinkCommand cmd)
 
     target.localScale = cmd.scale;
 
-    Reply("OK", "Updated: " + cmd.objectId);
+            Reply("OK", "Updated: " + cmd.objectId, null, cmd.requestId);
 }
 
 
         private void Reply(
             string status,
             string message,
-            LiveLinkHandshakeResponse handshake = null)
+            LiveLinkHandshakeResponse handshake = null,
+            string requestId = null)
         {
             LiveLinkResponse response = new LiveLinkResponse
             {
                 status = status,
                 message = message,
+                requestId = requestId,
                 handshake = handshake
             };
 

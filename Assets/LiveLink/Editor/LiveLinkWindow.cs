@@ -1,5 +1,6 @@
 
 using System;
+using System.Linq;
 using System.Text;
 using UnityEditor;
 using UnityEditor.Networking.PlayerConnection;
@@ -34,6 +35,9 @@ namespace LiveLink.Editor
 
         private void OnEnable()
         {
+            // Initialize session compatibility tracking before connections
+            // begin delivering responses to this window.
+            _ = LiveLinkCompatibilityManager.GetSessions();
             EditorConnection.instance.Initialize();
 
             EditorConnection.instance.Register(
@@ -138,14 +142,30 @@ namespace LiveLink.Editor
 
             Transform t = selectedTarget.transform;
 
-            Send(new LiveLinkCommand
+            var command = new LiveLinkCommand
             {
                 type = "TRANSFORM",
                 objectId = selectedTarget.ObjectId,
                 position = t.localPosition,
                 rotation = t.localEulerAngles,
                 scale = t.localScale
-            });
+            };
+
+            if (!LiveLinkCompatibilityManager.TrySendTransform(
+                    command,
+                    out string diagnostic))
+            {
+                lastResponse = "Sync blocked: " +
+                    (string.IsNullOrEmpty(diagnostic)
+                        ? "Player compatibility has not been verified."
+                        : diagnostic);
+                Repaint();
+            }
+            else
+            {
+                lastResponse = "Transform sent to compatible Player.";
+                Repaint();
+            }
         }
 
         private void Send(LiveLinkCommand command)
@@ -181,6 +201,15 @@ namespace LiveLink.Editor
         private void OnResponse(
             UnityEngine.Networking.PlayerConnection.MessageEventArgs args)
         {
+            LiveLinkResponse response = JsonUtility.FromJson<LiveLinkResponse>(
+                Encoding.UTF8.GetString(args.data));
+            if (response != null)
+            {
+                LiveLinkCompatibilityManager.HandlePlayerConnectionResponse(
+                    args.playerId,
+                    response);
+            }
+
             ProcessResponse(args.playerId, args.data);
         }
 
@@ -218,7 +247,18 @@ namespace LiveLink.Editor
                 Resources.FindObjectsOfTypeAll<LiveLinkWindow>();
 
             if (windows.Length > 0)
+            {
+                LiveLinkResponse response = JsonUtility.FromJson<LiveLinkResponse>(
+                    Encoding.UTF8.GetString(data));
+                if (response != null)
+                {
+                    LiveLinkCompatibilityManager.HandleDiscoveryResponse(
+                        playerId,
+                        response);
+                }
+
                 windows[0].ProcessResponse(playerId, data);
+            }
         }
 
         private void OnGUI()
@@ -236,6 +276,27 @@ namespace LiveLink.Editor
 
             EditorGUILayout.LabelField(
                 "Status", lastResponse);
+
+            var compatibilitySessions =
+                LiveLinkCompatibilityManager.GetSessions();
+            if (compatibilitySessions.Count > 0)
+            {
+                LiveLinkCompatibilityManager.SessionSnapshot active =
+                    compatibilitySessions
+                        .LastOrDefault(session =>
+                            session.State !=
+                            LiveLinkCompatibilityState.Disconnected);
+
+                if (active != null)
+                {
+                    EditorGUILayout.LabelField(
+                        "Compatibility",
+                        active.State.ToString());
+                    EditorGUILayout.LabelField(
+                        "Compatibility Detail",
+                        active.Diagnostic);
+                }
+            }
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField(

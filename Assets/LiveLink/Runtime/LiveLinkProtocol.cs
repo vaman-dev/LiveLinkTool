@@ -16,7 +16,9 @@ namespace LiveLink
     [Serializable]
     public class LiveLinkCommand
     {
+        public string requestId;
         public string type;
+        public string manifestFingerprint;
         public string objectId;
         public Vector3 position;
         public Vector3 rotation;
@@ -26,6 +28,7 @@ namespace LiveLink
     [Serializable]
     public class LiveLinkResponse
     {
+        public string requestId;
         public string status;
         public string message;
         public LiveLinkHandshakeResponse handshake;

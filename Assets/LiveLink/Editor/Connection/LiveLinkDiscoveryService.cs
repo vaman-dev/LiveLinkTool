@@ -55,6 +55,10 @@ namespace LiveLink.Editor.Connection
         private static double nextAnnouncement;
         private static bool started;
 
+        internal static event Action<int> SessionConnected;
+        internal static event Action<int> SessionDisconnected;
+        internal static event Action<int, byte[]> ResponseReceived;
+
         static LiveLinkDiscoveryService()
         {
             EditorApplication.update += Update;
@@ -80,6 +84,25 @@ namespace LiveLink.Editor.Connection
             }
 
             return sent;
+        }
+
+        internal static bool TrySendTo(
+            int playerId,
+            LiveLinkCommand command)
+        {
+            if (!clients.TryGetValue(playerId, out Client client))
+                return false;
+
+            try
+            {
+                client.Writer.WriteLine(JsonUtility.ToJson(command));
+                return true;
+            }
+            catch
+            {
+                Remove(playerId);
+                return false;
+            }
         }
 
         private static void Start()
@@ -123,6 +146,9 @@ namespace LiveLink.Editor.Connection
 
             while (responses.TryDequeue(out ReceivedResponse response))
             {
+                ResponseReceived?.Invoke(
+                    response.PlayerId,
+                    response.Data);
                 LiveLinkWindow.ReceiveDiscoveryResponse(
                     response.PlayerId,
                     response.Data);
@@ -138,6 +164,7 @@ namespace LiveLink.Editor.Connection
                 int playerId = -Math.Abs(tcp.Client.RemoteEndPoint.GetHashCode());
                 var client = new Client(tcp, playerId);
                 clients[playerId] = client;
+                SessionConnected?.Invoke(playerId);
 
                 Thread reader = new Thread(() => ReadClient(client))
                 {
@@ -221,6 +248,7 @@ namespace LiveLink.Editor.Connection
 
             try { client.Writer.Dispose(); } catch { }
             try { client.Tcp.Close(); } catch { }
+            SessionDisconnected?.Invoke(playerId);
         }
     }
 }

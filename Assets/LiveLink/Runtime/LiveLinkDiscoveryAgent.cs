@@ -22,6 +22,7 @@ namespace LiveLink
         private TcpClient client;
         private StreamWriter writer;
         private string productName;
+        private bool transformAuthorizationGranted;
 
         internal static void Start()
         {
@@ -54,8 +55,10 @@ namespace LiveLink
 
         private void DiscoveryLoop()
         {
-            using (var udp = new UdpClient(LiveLinkDiscoverySettings.DiscoveryPort))
+            UdpClient udp = null;
+            try
             {
+                udp = new UdpClient(LiveLinkDiscoverySettings.DiscoveryPort);
                 udp.Client.ReceiveTimeout = 750;
 
                 while (!stopping)
@@ -82,6 +85,19 @@ namespace LiveLink
                             exception.Message);
                     }
                 }
+            }
+            catch (SocketException exception)
+            {
+                if (!stopping)
+                {
+                    Debug.LogWarning(
+                        "[LiveLink] Discovery UDP unavailable: " +
+                        exception.Message);
+                }
+            }
+            finally
+            {
+                udp?.Close();
             }
         }
 
@@ -182,10 +198,13 @@ namespace LiveLink
                 switch (command.type)
                 {
                     case "PING":
-                        SendReply("OK", "PONG");
+                        SendReply("OK", "PONG", null, command.requestId);
                         break;
                     case "MANIFEST_REQUEST":
-                        SendManifestResponse();
+                        SendManifestResponse(command.requestId);
+                        break;
+                    case "SYNC_AUTHORIZATION":
+                        AuthorizeTransforms(command);
                         break;
                     case "TRANSFORM":
                         ApplyTransform(command);
@@ -201,7 +220,31 @@ namespace LiveLink
             }
         }
 
-        private void SendManifestResponse()
+        private void AuthorizeTransforms(LiveLinkCommand command)
+        {
+            LiveLinkBuildIdentity identity =
+                Resources.Load<LiveLinkBuildIdentity>(
+                    "LiveLinkBuildIdentity");
+
+            bool authorized =
+                identity != null &&
+                !string.IsNullOrWhiteSpace(identity.ManifestFingerprint) &&
+                string.Equals(
+                    identity.ManifestFingerprint,
+                    command.manifestFingerprint,
+                    StringComparison.OrdinalIgnoreCase);
+
+            transformAuthorizationGranted = authorized;
+            SendReply(
+                authorized ? "OK" : "ERROR",
+                authorized
+                    ? "SYNC_AUTHORIZED"
+                    : "Transform authorization fingerprint mismatch.",
+                null,
+                command.requestId);
+        }
+
+        private void SendManifestResponse(string requestId)
         {
             LiveLinkBuildIdentity identity =
                 Resources.Load<LiveLinkBuildIdentity>(
@@ -209,14 +252,16 @@ namespace LiveLink
 
             if (identity == null)
             {
-                SendReply("ERROR", "Development manifest resource is missing.");
+                SendReply("ERROR", "Development manifest resource is missing.",
+                    null, requestId);
                 return;
             }
 
             if (identity.ProtocolVersion <= 0 ||
                 string.IsNullOrWhiteSpace(identity.ManifestFingerprint))
             {
-                SendReply("ERROR", "Development manifest resource is invalid.");
+                SendReply("ERROR", "Development manifest resource is invalid.",
+                    null, requestId);
                 return;
             }
 
@@ -226,11 +271,22 @@ namespace LiveLink
                     protocolVersion = identity.ProtocolVersion,
                     fingerprint = identity.ManifestFingerprint,
                     buildName = "LiveLink"
-                });
+                },
+                requestId);
         }
 
         private void ApplyTransform(LiveLinkCommand command)
         {
+            if (!transformAuthorizationGranted)
+            {
+                SendReply(
+                    "ERROR",
+                    "Transform synchronization is not authorized for this build.",
+                    null,
+                    command.requestId);
+                return;
+            }
+
             if (!LiveLinkObjectRegistry.TryGet(
                     command.objectId,
                     out LiveLinkIdentity identity,
@@ -244,18 +300,21 @@ namespace LiveLink
             target.localPosition = command.position;
             target.localRotation = Quaternion.Euler(command.rotation);
             target.localScale = command.scale;
-            SendReply("OK", "Updated: " + command.objectId);
+            SendReply("OK", "Updated: " + command.objectId,
+                null, command.requestId);
         }
 
         private void SendReply(
             string status,
             string message,
-            LiveLinkHandshakeResponse handshake = null)
+            LiveLinkHandshakeResponse handshake = null,
+            string requestId = null)
         {
             LiveLinkResponse response = new LiveLinkResponse
             {
                 status = status,
                 message = message,
+                requestId = requestId,
                 handshake = handshake
             };
 
