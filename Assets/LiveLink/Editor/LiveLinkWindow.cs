@@ -153,7 +153,14 @@ namespace LiveLink.Editor
             if (EditorConnection.instance
                     .ConnectedPlayers.Count == 0)
             {
-                lastResponse = "No connected Player";
+                if (LiveLinkDiscoveryService.TrySend(command))
+                {
+                    lastResponse = "Sent through discovery connection";
+                }
+                else
+                {
+                    lastResponse = "No connected Player";
+                }
                 Repaint();
                 return;
             }
@@ -174,7 +181,12 @@ namespace LiveLink.Editor
         private void OnResponse(
             UnityEngine.Networking.PlayerConnection.MessageEventArgs args)
         {
-            string json = Encoding.UTF8.GetString(args.data);
+            ProcessResponse(args.playerId, args.data);
+        }
+
+        private void ProcessResponse(int playerId, byte[] data)
+        {
+            string json = Encoding.UTF8.GetString(data);
             LiveLinkResponse response =
                 JsonUtility.FromJson<LiveLinkResponse>(json);
 
@@ -183,7 +195,7 @@ namespace LiveLink.Editor
 
             if (response.handshake != null)
             {
-                manifestPlayerId = args.playerId;
+                manifestPlayerId = playerId;
                 manifestProtocolVersion =
                     response.handshake.protocolVersion;
                 manifestFingerprint =
@@ -196,6 +208,17 @@ namespace LiveLink.Editor
                 response.status + ": " + response.message;
 
             Repaint();
+        }
+
+        internal static void ReceiveDiscoveryResponse(
+            int playerId,
+            byte[] data)
+        {
+            LiveLinkWindow[] windows =
+                Resources.FindObjectsOfTypeAll<LiveLinkWindow>();
+
+            if (windows.Length > 0)
+                windows[0].ProcessResponse(playerId, data);
         }
 
         private void OnGUI()

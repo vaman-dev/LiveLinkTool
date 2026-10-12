@@ -28,6 +28,7 @@ namespace LiveLink
             DontDestroyOnLoad(host);
             instance =
                 host.AddComponent<LiveLinkRuntimeAgent>();
+            LiveLinkDiscoveryAgent.Start();
         }
 
 
