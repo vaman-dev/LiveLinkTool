@@ -14,21 +14,21 @@ namespace LiveLink
     {
         private static LiveLinkRuntimeAgent instance;
 
-       [RuntimeInitializeOnLoadMethod(
-    RuntimeInitializeLoadType.AfterSceneLoad)]
-private static void Bootstrap()
-{
-    if (!Debug.isDebugBuild)
-        return;
+        [RuntimeInitializeOnLoadMethod(
+            RuntimeInitializeLoadType.AfterAssembliesLoaded)]
+        private static void Bootstrap()
+        {
+            if (instance != null)
+                return;
 
-if (instance != null)
-return;
-GameObject host =
-new GameObject("[LiveLink Runtime]");
-DontDestroyOnLoad(host);
-instance =
-host.AddComponent<LiveLinkRuntimeAgent>();
-}
+            Debug.Log("[LiveLink] Runtime bootstrap reached");
+
+            GameObject host =
+                new GameObject("[LiveLink Runtime]");
+            DontDestroyOnLoad(host);
+            instance =
+                host.AddComponent<LiveLinkRuntimeAgent>();
+        }
 
 
 private void OnEnable()
@@ -84,6 +84,10 @@ private void OnDisable()
                         Reply("OK", "PONG");
                         break;
 
+                    case "MANIFEST_REQUEST":
+                        SendManifestResponse();
+                        break;
+
                     case "TRANSFORM":
                         ApplyTransform(cmd);
                         break;
@@ -97,6 +101,41 @@ private void OnDisable()
             {
                 Reply("ERROR", e.Message);
             }
+        }
+
+        private void SendManifestResponse()
+        {
+            LiveLinkBuildIdentity identity =
+                Resources.Load<LiveLinkBuildIdentity>(
+                    "LiveLinkBuildIdentity");
+
+            if (identity == null)
+            {
+                Reply(
+                    "ERROR",
+                    "Development manifest resource is missing.");
+                return;
+            }
+
+            if (identity.ProtocolVersion <= 0 ||
+                string.IsNullOrWhiteSpace(
+                    identity.ManifestFingerprint))
+            {
+                Reply(
+                    "ERROR",
+                    "Development manifest resource is invalid.");
+                return;
+            }
+
+            Reply(
+                "OK",
+                "MANIFEST_RESPONSE",
+                new LiveLinkHandshakeResponse
+                {
+                    protocolVersion = identity.ProtocolVersion,
+                    fingerprint = identity.ManifestFingerprint,
+                    buildName = "LiveLink"
+                });
         }
 
        
@@ -122,12 +161,16 @@ private void ApplyTransform(LiveLinkCommand cmd)
 }
 
 
-        private void Reply(string status, string message)
+        private void Reply(
+            string status,
+            string message,
+            LiveLinkHandshakeResponse handshake = null)
         {
             LiveLinkResponse response = new LiveLinkResponse
             {
                 status = status,
-                message = message
+                message = message,
+                handshake = handshake
             };
 
             byte[] data = Encoding.UTF8.GetBytes(

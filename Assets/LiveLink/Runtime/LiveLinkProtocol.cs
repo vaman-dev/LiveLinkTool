@@ -28,5 +28,14 @@ namespace LiveLink
     {
         public string status;
         public string message;
+        public LiveLinkHandshakeResponse handshake;
+    }
+
+    [Serializable]
+    public class LiveLinkHandshakeResponse
+    {
+        public int protocolVersion;
+        public string fingerprint;
+        public string buildName;
     }
 }

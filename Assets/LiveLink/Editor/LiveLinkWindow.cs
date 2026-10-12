@@ -4,6 +4,7 @@ using System.Text;
 using UnityEditor;
 using UnityEditor.Networking.PlayerConnection;
 using UnityEngine;
+using LiveLink.Editor.Connection;
 
 namespace LiveLink.Editor
 {
@@ -15,8 +16,17 @@ namespace LiveLink.Editor
         private Vector3 lastScale;
         private bool autoSync = true;
         private string lastResponse = "Not connected";
+        // Unity PlayerConnection IDs may be negative. Use a dedicated
+        // sentinel instead of treating non-negative IDs as valid only.
+        private int manifestPlayerId = int.MinValue;
+        private int manifestProtocolVersion;
+        private string manifestFingerprint = "";
+        private string manifestBuildName = "";
+        private string detectedNetworkAddress = "Detecting...";
+        private string networkDiagnostic = "";
+        private double nextNetworkRefresh;
 
-        [MenuItem("Tools/LiveLink")]
+        [MenuItem("Tools/LiveLink/Open LiveLink Window")]
         public static void Open()
         {
             GetWindow<LiveLinkWindow>("LiveLink");
@@ -34,6 +44,7 @@ namespace LiveLink.Editor
             Selection.selectionChanged += OnSelectionChanged;
 
             OnSelectionChanged();
+            RefreshNetworkConfiguration();
         }
 
         private void OnDisable()
@@ -75,6 +86,11 @@ namespace LiveLink.Editor
 
         private void OnEditorUpdate()
         {
+            if (EditorApplication.timeSinceStartup >= nextNetworkRefresh)
+            {
+                RefreshNetworkConfiguration();
+            }
+
             if (selectedTarget == null)
                 return;
 
@@ -93,6 +109,26 @@ namespace LiveLink.Editor
 
             if (autoSync && !EditorApplication.isPlaying)
                 SendTransform();
+        }
+
+        private void RefreshNetworkConfiguration()
+        {
+            nextNetworkRefresh = EditorApplication.timeSinceStartup + 2.0;
+
+            if (LiveLinkNetworkDetector.TryGetPreferredAddress(
+                    out string address,
+                    out string diagnostic))
+            {
+                detectedNetworkAddress = address;
+                networkDiagnostic = diagnostic;
+            }
+            else
+            {
+                detectedNetworkAddress = "Unavailable / ambiguous";
+                networkDiagnostic = diagnostic;
+            }
+
+            Repaint();
         }
 
         private void SendTransform()
@@ -145,6 +181,17 @@ namespace LiveLink.Editor
             if (response == null)
                 return;
 
+            if (response.handshake != null)
+            {
+                manifestPlayerId = args.playerId;
+                manifestProtocolVersion =
+                    response.handshake.protocolVersion;
+                manifestFingerprint =
+                    response.handshake.fingerprint ?? "";
+                manifestBuildName =
+                    response.handshake.buildName ?? "";
+            }
+
             lastResponse =
                 response.status + ": " + response.message;
 
@@ -168,6 +215,20 @@ namespace LiveLink.Editor
                 "Status", lastResponse);
 
             EditorGUILayout.Space();
+            EditorGUILayout.LabelField(
+                "Network Configuration",
+                EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "Detected Editor IPv4",
+                detectedNetworkAddress);
+            EditorGUILayout.LabelField(
+                "Network Diagnostic",
+                networkDiagnostic);
+
+            if (GUILayout.Button("Refresh Network Configuration"))
+                RefreshNetworkConfiguration();
+
+            EditorGUILayout.Space();
 
             autoSync = EditorGUILayout.Toggle(
                 "Automatic Sync", autoSync);
@@ -178,6 +239,31 @@ namespace LiveLink.Editor
                 {
                     type = "PING"
                 });
+            }
+
+            if (GUILayout.Button("Request Manifest"))
+            {
+                Send(new LiveLinkCommand
+                {
+                    type = "MANIFEST_REQUEST"
+                });
+            }
+
+            if (manifestPlayerId != int.MinValue)
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField(
+                    "Manifest Player ID",
+                    manifestPlayerId.ToString());
+                EditorGUILayout.LabelField(
+                    "Player Protocol",
+                    manifestProtocolVersion.ToString());
+                EditorGUILayout.LabelField(
+                    "Player Build",
+                    manifestBuildName);
+                EditorGUILayout.LabelField(
+                    "Player Fingerprint",
+                    manifestFingerprint);
             }
 
             EditorGUILayout.Space();

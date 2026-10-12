@@ -37,7 +37,7 @@ MonoBehaviour:
         m_ConnectProfiler: 1
         m_BuildWithDeepProfilingSupport: 0
         m_BuildWithCodeCoverage: 0
-        m_AllowDebugging: 0
+        m_AllowDebugging: 1
         m_WaitForManagedDebugger: 0
         m_ManagedDebuggerFixedPort: 0
         m_ExplicitNullChecks: 0
