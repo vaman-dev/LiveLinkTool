@@ -19,6 +19,9 @@ namespace LiveLink
         public string requestId;
         public string type;
         public string manifestFingerprint;
+        public string authPairingId;
+        public string authChallenge;
+        public string authProof;
         public string objectId;
         public Vector3 position;
         public Vector3 rotation;
@@ -32,6 +35,9 @@ namespace LiveLink
         public string status;
         public string message;
         public LiveLinkHandshakeResponse handshake;
+        public string authPairingId;
+        public string authChallenge;
+        public string authProof;
     }
 
     [Serializable]

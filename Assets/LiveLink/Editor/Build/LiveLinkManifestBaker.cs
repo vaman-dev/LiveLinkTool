@@ -32,6 +32,19 @@ namespace LiveLink.Editor.Build
             serialized.FindProperty("protocolVersion").intValue = 1;
             serialized.FindProperty("manifestFingerprint")
                 .stringValue = fingerprint;
+            var pairingSecret = LiveLinkPairingSecretStore.GetOrCreateSecret();
+            var pairingSecretProperty = serialized.FindProperty("pairingSecret");
+            var pairingIdProperty = serialized.FindProperty("pairingId");
+            if (pairingSecretProperty == null || pairingIdProperty == null)
+            {
+                Object.DestroyImmediate(asset);
+                Debug.LogError(
+                    "[LiveLink] Build identity schema is missing TCP pairing fields.");
+                return false;
+            }
+
+            pairingSecretProperty.stringValue = pairingSecret;
+            pairingIdProperty.stringValue = LiveLinkAuthentication.ComputePairingId(pairingSecret);
             serialized.ApplyModifiedPropertiesWithoutUndo();
 
             AssetDatabase.CreateAsset(asset, ResourcePath);

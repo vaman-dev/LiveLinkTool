@@ -23,6 +23,8 @@ namespace LiveLink
         private StreamWriter writer;
         private string productName;
         private bool transformAuthorizationGranted;
+        private bool authenticationGranted;
+        private string pendingAuthenticationChallenge;
 
         internal static void Start()
         {
@@ -130,6 +132,8 @@ namespace LiveLink
                     };
                     writer.WriteLine(LiveLinkDiscoverySettings.HelloPrefix +
                         "|" + productName);
+                    authenticationGranted = false;
+                    transformAuthorizationGranted = false;
                     Debug.Log("[LiveLink] Discovery connected to Editor " +
                         address + ":" + port);
 
@@ -197,16 +201,37 @@ namespace LiveLink
 
                 switch (command.type)
                 {
+                    case "AUTH_CHALLENGE":
+                        Authenticate(command);
+                        break;
+                    case "AUTH_ACCEPT":
+                        AcceptAuthentication(command);
+                        break;
                     case "PING":
                         SendReply("OK", "PONG", null, command.requestId);
                         break;
                     case "MANIFEST_REQUEST":
+                        if (!authenticationGranted)
+                        {
+                            SendReply("ERROR", "TCP authentication required.", null, command.requestId);
+                            break;
+                        }
                         SendManifestResponse(command.requestId);
                         break;
                     case "SYNC_AUTHORIZATION":
+                        if (!authenticationGranted)
+                        {
+                            SendReply("ERROR", "TCP authentication required.", null, command.requestId);
+                            break;
+                        }
                         AuthorizeTransforms(command);
                         break;
                     case "TRANSFORM":
+                        if (!authenticationGranted)
+                        {
+                            SendReply("ERROR", "TCP authentication required.", null, command.requestId);
+                            break;
+                        }
                         ApplyTransform(command);
                         break;
                     default:
@@ -217,6 +242,63 @@ namespace LiveLink
             catch (Exception exception)
             {
                 SendReply("ERROR", exception.Message);
+            }
+        }
+
+        private void Authenticate(LiveLinkCommand command)
+        {
+            LiveLinkBuildIdentity identity = Resources.Load<LiveLinkBuildIdentity>(
+                "LiveLinkBuildIdentity");
+            string rejectionReason = null;
+            string expectedPairingId = null;
+            if (identity == null)
+                rejectionReason = "manifest resource missing";
+            else if (string.IsNullOrWhiteSpace(identity.PairingSecret))
+                rejectionReason = "pairing secret missing from build";
+            else
+            {
+                expectedPairingId = LiveLinkAuthentication.ComputePairingId(
+                    identity.PairingSecret);
+                if (!string.Equals(expectedPairingId, command.authPairingId, StringComparison.Ordinal))
+                    rejectionReason = "pairing ID mismatch";
+                else if (string.IsNullOrWhiteSpace(command.authChallenge))
+                    rejectionReason = "challenge missing";
+            }
+
+            bool valid = rejectionReason == null;
+
+            pendingAuthenticationChallenge = valid ? command.authChallenge : null;
+            authenticationGranted = false;
+            Debug.Log(valid
+                ? "[LiveLink] TCP authentication challenge received."
+                : "[LiveLink] TCP authentication challenge rejected: " + rejectionReason);
+            SendReply(
+                valid ? "OK" : "ERROR",
+                valid ? "AUTH_RESPONSE" : "TCP authentication failed.",
+                null,
+                command.requestId,
+                expectedPairingId,
+                command.authChallenge,
+                valid ? LiveLinkAuthentication.ComputeProof(
+                    identity.PairingSecret,
+                    expectedPairingId,
+                    command.authChallenge) : null);
+        }
+
+        private void AcceptAuthentication(LiveLinkCommand command)
+        {
+            LiveLinkBuildIdentity identity = Resources.Load<LiveLinkBuildIdentity>(
+                "LiveLinkBuildIdentity");
+            authenticationGranted = identity != null &&
+                string.Equals(identity.PairingId, command.authPairingId, StringComparison.Ordinal) &&
+                string.Equals(pendingAuthenticationChallenge, command.authChallenge, StringComparison.Ordinal);
+            if (!authenticationGranted)
+            {
+                transformAuthorizationGranted = false;
+            }
+            else
+            {
+                Debug.Log("[LiveLink] TCP authentication accepted by Editor.");
             }
         }
 
@@ -308,14 +390,20 @@ namespace LiveLink
             string status,
             string message,
             LiveLinkHandshakeResponse handshake = null,
-            string requestId = null)
+            string requestId = null,
+            string authPairingId = null,
+            string authChallenge = null,
+            string authProof = null)
         {
             LiveLinkResponse response = new LiveLinkResponse
             {
                 status = status,
                 message = message,
                 requestId = requestId,
-                handshake = handshake
+                handshake = handshake,
+                authPairingId = authPairingId,
+                authChallenge = authChallenge,
+                authProof = authProof
             };
 
             string json = JsonUtility.ToJson(response);
@@ -344,6 +432,9 @@ namespace LiveLink
                 try { client?.Close(); } catch { }
                 writer = null;
                 client = null;
+                authenticationGranted = false;
+                transformAuthorizationGranted = false;
+                pendingAuthenticationChallenge = null;
             }
         }
 

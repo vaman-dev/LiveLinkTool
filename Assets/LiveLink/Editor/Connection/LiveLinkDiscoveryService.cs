@@ -20,6 +20,10 @@ namespace LiveLink.Editor.Connection
             internal readonly TcpClient Tcp;
             internal readonly StreamWriter Writer;
             internal readonly int PlayerId;
+            internal readonly object WriteGate = new object();
+            internal string Challenge;
+            internal bool Authenticated;
+            internal DateTime AuthenticationDeadlineUtc;
 
             internal Client(TcpClient tcp, int playerId)
             {
@@ -47,6 +51,8 @@ namespace LiveLink.Editor.Connection
 
         private static readonly ConcurrentQueue<ReceivedResponse> responses =
             new ConcurrentQueue<ReceivedResponse>();
+        private static readonly ConcurrentQueue<Action> mainThreadActions =
+            new ConcurrentQueue<Action>();
         private static readonly object gate = new object();
         private static readonly ConcurrentDictionary<int, Client> clients =
             new ConcurrentDictionary<int, Client>();
@@ -72,9 +78,15 @@ namespace LiveLink.Editor.Connection
 
             foreach (Client client in clients.Values)
             {
+                if (!client.Authenticated)
+                    continue;
+
                 try
                 {
-                    client.Writer.WriteLine(json);
+                    lock (client.WriteGate)
+                    {
+                        client.Writer.WriteLine(json);
+                    }
                     sent = true;
                 }
                 catch
@@ -90,12 +102,16 @@ namespace LiveLink.Editor.Connection
             int playerId,
             LiveLinkCommand command)
         {
-            if (!clients.TryGetValue(playerId, out Client client))
+            if (!clients.TryGetValue(playerId, out Client client) ||
+                !client.Authenticated)
                 return false;
 
             try
             {
-                client.Writer.WriteLine(JsonUtility.ToJson(command));
+                lock (client.WriteGate)
+                {
+                    client.Writer.WriteLine(JsonUtility.ToJson(command));
+                }
                 return true;
             }
             catch
@@ -138,6 +154,15 @@ namespace LiveLink.Editor.Connection
 
             AcceptClients();
 
+            foreach (Client client in clients.Values)
+            {
+                if (!client.Authenticated &&
+                    DateTime.UtcNow > client.AuthenticationDeadlineUtc)
+                {
+                    Remove(client.PlayerId);
+                }
+            }
+
             if (EditorApplication.timeSinceStartup >= nextAnnouncement)
             {
                 BroadcastAnnouncement();
@@ -153,6 +178,11 @@ namespace LiveLink.Editor.Connection
                     response.PlayerId,
                     response.Data);
             }
+
+            while (mainThreadActions.TryDequeue(out Action action))
+            {
+                action.Invoke();
+            }
         }
 
         private static void AcceptClients()
@@ -164,7 +194,7 @@ namespace LiveLink.Editor.Connection
                 int playerId = -Math.Abs(tcp.Client.RemoteEndPoint.GetHashCode());
                 var client = new Client(tcp, playerId);
                 clients[playerId] = client;
-                SessionConnected?.Invoke(playerId);
+                BeginAuthentication(client);
 
                 Thread reader = new Thread(() => ReadClient(client))
                 {
@@ -190,25 +220,128 @@ namespace LiveLink.Editor.Connection
                         if (line == null)
                             break;
 
-                        if (!line.StartsWith(
+                        if (line.Length > 1024 * 1024)
+                        {
+                            Remove(client.PlayerId);
+                            return;
+                        }
+
+                        if (line.StartsWith(
                                 LiveLinkDiscoverySettings.HelloPrefix,
                                 StringComparison.Ordinal))
                         {
-                            responses.Enqueue(new ReceivedResponse(
-                                client.PlayerId,
-                                Encoding.UTF8.GetBytes(line)));
+                            continue;
                         }
+
+                        if (!client.Authenticated)
+                        {
+                            if (!CompleteAuthentication(client, line))
+                            {
+                                Remove(client.PlayerId);
+                                return;
+                            }
+
+                            continue;
+                        }
+
+                        responses.Enqueue(new ReceivedResponse(
+                            client.PlayerId,
+                            Encoding.UTF8.GetBytes(line)));
                     }
                 }
             }
             catch (Exception exception)
             {
-                Debug.LogWarning("[LiveLink] Discovery client stopped: " +
-                    exception.Message);
+                if (client.Tcp.Connected)
+                {
+                    Debug.LogWarning("[LiveLink] Discovery client stopped: " +
+                        exception.Message);
+                }
             }
             finally
             {
                 Remove(client.PlayerId);
+            }
+        }
+
+        private static void BeginAuthentication(Client client)
+        {
+            client.Challenge = LiveLinkAuthentication.CreateChallenge();
+            client.AuthenticationDeadlineUtc = DateTime.UtcNow.AddSeconds(5);
+            var challenge = new LiveLinkCommand
+            {
+                requestId = Guid.NewGuid().ToString("N"),
+                type = "AUTH_CHALLENGE",
+                authPairingId = LiveLinkAuthentication.ComputePairingId(
+                    LiveLinkPairingSecretStore.GetOrCreateSecret()),
+                authChallenge = client.Challenge
+            };
+
+            SendToClient(client, challenge);
+            Debug.Log("[LiveLink] TCP authentication challenge sent for session " +
+                client.PlayerId);
+        }
+
+        private static bool CompleteAuthentication(Client client, string line)
+        {
+            LiveLinkResponse response;
+            try
+            {
+                response = JsonUtility.FromJson<LiveLinkResponse>(line);
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (response == null)
+            {
+                Debug.LogWarning("[LiveLink] TCP authentication rejected: malformed response.");
+                return false;
+            }
+
+            if (response.message != "AUTH_RESPONSE")
+            {
+                Debug.LogWarning("[LiveLink] TCP authentication rejected: unexpected response type '" +
+                    response.message + "' with status '" + response.status + "'.");
+                return false;
+            }
+
+            if (response.authChallenge != client.Challenge)
+            {
+                Debug.LogWarning("[LiveLink] TCP authentication rejected: challenge mismatch.");
+                return false;
+            }
+
+            var secret = LiveLinkPairingSecretStore.GetOrCreateSecret();
+            var pairingId = LiveLinkAuthentication.ComputePairingId(secret);
+            if (!string.Equals(response.authPairingId, pairingId, StringComparison.Ordinal) ||
+                !LiveLinkAuthentication.VerifyProof(
+                    secret, pairingId, client.Challenge, response.authProof))
+            {
+                Debug.LogWarning("[LiveLink] TCP authentication rejected: invalid pairing proof.");
+                return false;
+            }
+
+            client.Authenticated = true;
+            SendToClient(client, new LiveLinkCommand
+            {
+                requestId = Guid.NewGuid().ToString("N"),
+                type = "AUTH_ACCEPT",
+                authPairingId = pairingId,
+                authChallenge = client.Challenge
+            });
+            mainThreadActions.Enqueue(() => SessionConnected?.Invoke(client.PlayerId));
+            Debug.Log("[LiveLink] TCP authentication accepted for session " +
+                client.PlayerId);
+            return true;
+        }
+
+        private static void SendToClient(Client client, LiveLinkCommand command)
+        {
+            lock (client.WriteGate)
+            {
+                client.Writer.WriteLine(JsonUtility.ToJson(command));
             }
         }
 
@@ -248,7 +381,7 @@ namespace LiveLink.Editor.Connection
 
             try { client.Writer.Dispose(); } catch { }
             try { client.Tcp.Close(); } catch { }
-            SessionDisconnected?.Invoke(playerId);
+            mainThreadActions.Enqueue(() => SessionDisconnected?.Invoke(playerId));
         }
     }
 }

@@ -13,8 +13,18 @@ namespace LiveLink
         [SerializeField]
         private string manifestFingerprint = "";
 
+        [SerializeField]
+        private string pairingId = "";
+
+        [SerializeField]
+        private string pairingSecret = "";
+
         public int ProtocolVersion => protocolVersion;
 
         public string ManifestFingerprint => manifestFingerprint;
+
+        public string PairingId => pairingId;
+
+        public string PairingSecret => pairingSecret;
     }
 }
