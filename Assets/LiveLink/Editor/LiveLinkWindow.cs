@@ -1,5 +1,6 @@
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using UnityEditor;
@@ -11,6 +12,45 @@ namespace LiveLink.Editor
 {
     public sealed class LiveLinkWindow : EditorWindow
     {
+        private enum TrackingScope
+        {
+            SelectedObject,
+            AllValidLiveLinkObjects
+        }
+
+        private sealed class TrackedObjectState
+        {
+            public LiveLinkIdentity identity;
+            public Vector3 position;
+            public Quaternion rotation;
+            public Vector3 scale;
+            public Light light;
+            public int lightIndex = -1;
+            public bool lightEnabled;
+            public float lightIntensity;
+            public Color lightColor;
+            public float lightRange;
+            public float lightSpotAngle;
+            public Renderer renderer;
+            public int rendererIndex = -1;
+            public Material[] materials = Array.Empty<Material>();
+            public MaterialSnapshot[] materialSnapshots = Array.Empty<MaterialSnapshot>();
+            public readonly List<int> pendingMaterialSlots = new List<int>();
+            public bool pendingTransform;
+            public bool pendingLight;
+            public bool pendingMaterial;
+            public double pendingDeadline;
+        }
+
+        private struct MaterialSnapshot
+        {
+            public Material material;
+            public Color color;
+            public float metallic;
+            public float smoothness;
+            public Color emission;
+        }
+
         private LiveLinkIdentity selectedTarget;
         private Vector3 lastPosition;
         private Quaternion lastRotation;
@@ -22,7 +62,25 @@ namespace LiveLink.Editor
         private Color lastLightColor;
         private float lastLightRange;
         private float lastLightSpotAngle;
+        private Renderer selectedRenderer;
+        private int selectedRendererIndex;
+        private int selectedMaterialSlot;
+        private Material selectedMaterial;
+        private Color lastMaterialColor;
+        private float lastMaterialMetallic;
+        private float lastMaterialSmoothness;
+        private Color lastMaterialEmission;
+        private const double AutoSyncDebounceSeconds = 0.15;
+        private bool pendingLightSync;
+        private bool pendingMaterialSync;
+        private LiveLinkIdentity pendingSyncTarget;
+        private double pendingSyncDeadline;
+        private Material lastMaterialReference;
+        private int lastMaterialSlotCount;
         private bool autoSync = true;
+        private TrackingScope trackingScope = TrackingScope.SelectedObject;
+        private readonly List<TrackedObjectState> trackedObjects =
+            new List<TrackedObjectState>();
         private string lastResponse = "Not connected";
         // Unity PlayerConnection IDs may be negative. Use a dedicated
         // sentinel instead of treating non-negative IDs as valid only.
@@ -70,6 +128,7 @@ namespace LiveLink.Editor
 
         private void OnSelectionChanged()
         {
+            ClearPendingAutomaticSync();
             selectedTarget = null;
 
             if (Selection.activeGameObject != null)
@@ -79,13 +138,21 @@ namespace LiveLink.Editor
                         .GetComponent<LiveLinkIdentity>();
             }
 
+            selectedMaterialSlot = 0;
             CaptureTransform();
             CaptureLight();
+            CaptureMaterial();
             Repaint();
         }
 
         private void CaptureTransform()
         {
+            if (trackingScope == TrackingScope.AllValidLiveLinkObjects)
+            {
+                DetectAllTrackedObjects();
+                return;
+            }
+
             if (selectedTarget == null)
                 return;
 
@@ -117,6 +184,65 @@ namespace LiveLink.Editor
             lastLightSpotAngle = selectedLight.spotAngle;
         }
 
+        private void CaptureMaterial()
+        {
+            selectedRenderer = null;
+            selectedMaterial = null;
+            selectedRendererIndex = -1;
+
+            if (selectedTarget == null)
+                return;
+
+            Renderer[] renderers = selectedTarget.GetComponents<Renderer>();
+            if (renderers.Length == 0 || renderers[0] == null)
+                return;
+
+            Material[] materials = renderers[0].sharedMaterials;
+            if (materials.Length == 0)
+                return;
+
+            selectedMaterialSlot = Mathf.Clamp(
+                selectedMaterialSlot, 0, materials.Length - 1);
+            if (materials[selectedMaterialSlot] == null)
+                return;
+
+            selectedRenderer = renderers[0];
+            selectedRendererIndex = 0;
+            selectedMaterial = materials[selectedMaterialSlot];
+            lastMaterialReference = selectedMaterial;
+            lastMaterialSlotCount = materials.Length;
+            lastMaterialColor = ReadMaterialColor(selectedMaterial);
+            lastMaterialMetallic = ReadMaterialFloat(
+                selectedMaterial, "_Metallic", 0f);
+            lastMaterialSmoothness = selectedMaterial.HasProperty("_Smoothness")
+                ? selectedMaterial.GetFloat("_Smoothness")
+                : ReadMaterialFloat(selectedMaterial, "_Glossiness", 0f);
+            lastMaterialEmission = ReadMaterialColor(
+                selectedMaterial, "_EmissionColor");
+        }
+
+        private static Color ReadMaterialColor(
+            Material material,
+            string preferred = "_BaseColor")
+        {
+            if (material == null)
+                return Color.white;
+            if (material.HasProperty(preferred))
+                return material.GetColor(preferred);
+            if (preferred == "_BaseColor" && material.HasProperty("_Color"))
+                return material.GetColor("_Color");
+            return Color.white;
+        }
+
+        private static float ReadMaterialFloat(
+            Material material,
+            string property,
+            float fallback)
+        {
+            return material != null && material.HasProperty(property)
+                ? material.GetFloat(property) : fallback;
+        }
+
         private void OnEditorUpdate()
         {
             if (EditorApplication.timeSinceStartup >= nextNetworkRefresh)
@@ -126,6 +252,26 @@ namespace LiveLink.Editor
 
             if (selectedTarget == null)
                 return;
+
+            if (!autoSync)
+            {
+                ClearPendingAutomaticSync();
+            }
+            else if (pendingSyncTarget == selectedTarget &&
+                     EditorApplication.timeSinceStartup >= pendingSyncDeadline)
+            {
+                bool sendLight = pendingLightSync;
+                bool sendMaterial = pendingMaterialSync;
+                ClearPendingAutomaticSync();
+
+                if (!EditorApplication.isPlaying)
+                {
+                    if (sendLight)
+                        SendLight();
+                    if (sendMaterial)
+                        SendMaterial();
+                }
+            }
 
             Transform t = selectedTarget.transform;
 
@@ -138,7 +284,10 @@ namespace LiveLink.Editor
             if (!changed)
             {
                 if (selectedLight == null)
+                {
+                    DetectAndSendMaterial();
                     return;
+                }
 
                 bool lightChanged =
                     selectedLight.enabled != lastLightEnabled ||
@@ -151,11 +300,52 @@ namespace LiveLink.Editor
                         selectedLight.spotAngle, lastLightSpotAngle);
 
                 if (!lightChanged)
+                {
+                    if (selectedRenderer == null || selectedMaterial == null)
+                        return;
+
+                    Material[] materials = selectedRenderer.sharedMaterials;
+                    if (selectedMaterialSlot >= materials.Length ||
+                        materials[selectedMaterialSlot] == null)
+                        return;
+
+                    Material currentMaterial = materials[selectedMaterialSlot];
+                    if (materials.Length != lastMaterialSlotCount ||
+                        currentMaterial != lastMaterialReference)
+                    {
+                        // Material assignment/slot layout changes are not a
+                        // property update. Refresh the baseline safely and
+                        // wait for a supported property edit.
+                        CaptureMaterial();
+                        return;
+                    }
+
+                    selectedMaterial = currentMaterial;
+                    bool materialChanged =
+                        ReadMaterialColor(selectedMaterial) != lastMaterialColor ||
+                        !Mathf.Approximately(ReadMaterialFloat(
+                            selectedMaterial, "_Metallic", 0f),
+                            lastMaterialMetallic) ||
+                        !Mathf.Approximately(
+                            selectedMaterial.HasProperty("_Smoothness")
+                                ? selectedMaterial.GetFloat("_Smoothness")
+                                : ReadMaterialFloat(
+                                    selectedMaterial, "_Glossiness", 0f),
+                            lastMaterialSmoothness) ||
+                        ReadMaterialColor(
+                            selectedMaterial, "_EmissionColor") !=
+                            lastMaterialEmission;
+
+                    if (!materialChanged)
+                        return;
+
+                    CaptureMaterial();
+                    QueueAutomaticSync(material: true);
                     return;
+                }
 
                 CaptureLight();
-                if (autoSync && !EditorApplication.isPlaying)
-                    SendLight();
+                QueueAutomaticSync(light: true);
                 return;
             }
 
@@ -163,6 +353,406 @@ namespace LiveLink.Editor
 
             if (autoSync && !EditorApplication.isPlaying)
                 SendTransform();
+        }
+
+        private void DetectAndSendMaterial()
+        {
+            if (selectedRenderer == null || selectedMaterial == null)
+                return;
+
+            Material[] materials = selectedRenderer.sharedMaterials;
+            if (selectedMaterialSlot >= materials.Length ||
+                materials[selectedMaterialSlot] == null)
+                return;
+
+            Material currentMaterial = materials[selectedMaterialSlot];
+            if (materials.Length != lastMaterialSlotCount ||
+                currentMaterial != lastMaterialReference)
+            {
+                CaptureMaterial();
+                return;
+            }
+
+            selectedMaterial = currentMaterial;
+            bool materialChanged =
+                ReadMaterialColor(selectedMaterial) != lastMaterialColor ||
+                !Mathf.Approximately(ReadMaterialFloat(
+                    selectedMaterial, "_Metallic", 0f),
+                    lastMaterialMetallic) ||
+                !Mathf.Approximately(
+                    selectedMaterial.HasProperty("_Smoothness")
+                        ? selectedMaterial.GetFloat("_Smoothness")
+                        : ReadMaterialFloat(
+                            selectedMaterial, "_Glossiness", 0f),
+                    lastMaterialSmoothness) ||
+                ReadMaterialColor(
+                    selectedMaterial, "_EmissionColor") !=
+                    lastMaterialEmission;
+
+            if (!materialChanged)
+                return;
+
+            CaptureMaterial();
+            QueueAutomaticSync(material: true);
+        }
+
+        private void QueueAutomaticSync(bool light = false, bool material = false)
+        {
+            if (!autoSync || selectedTarget == null || EditorApplication.isPlaying)
+                return;
+
+            pendingLightSync |= light;
+            pendingMaterialSync |= material;
+            pendingSyncTarget = selectedTarget;
+            pendingSyncDeadline =
+                EditorApplication.timeSinceStartup + AutoSyncDebounceSeconds;
+        }
+
+        private void ClearPendingAutomaticSync()
+        {
+            pendingLightSync = false;
+            pendingMaterialSync = false;
+            pendingSyncTarget = null;
+            pendingSyncDeadline = 0d;
+        }
+
+        private void DetectAllTrackedObjects()
+        {
+            ReconcileTrackedObjects();
+
+            if (!autoSync || EditorApplication.isPlaying)
+            {
+                foreach (TrackedObjectState state in trackedObjects)
+                {
+                    state.pendingTransform = false;
+                    state.pendingLight = false;
+                    state.pendingMaterial = false;
+                }
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            foreach (TrackedObjectState state in trackedObjects)
+            {
+                DetectTrackedObjectChanges(state, now);
+                if (now < state.pendingDeadline)
+                    continue;
+
+                if (state.pendingTransform)
+                    SendTransformFor(state);
+                if (state.pendingLight)
+                    SendLightFor(state);
+                if (state.pendingMaterial)
+                    SendMaterialFor(state);
+
+                state.pendingTransform = false;
+                state.pendingLight = false;
+                state.pendingMaterial = false;
+                state.pendingMaterialSlots.Clear();
+            }
+        }
+
+        private void ReconcileTrackedObjects()
+        {
+            LiveLinkIdentity[] identities =
+                Resources.FindObjectsOfTypeAll<LiveLinkIdentity>();
+
+            for (int i = trackedObjects.Count - 1; i >= 0; i--)
+            {
+                TrackedObjectState state = trackedObjects[i];
+                if (state.identity == null ||
+                    !state.identity.gameObject.scene.IsValid() ||
+                    !state.identity.gameObject.scene.isLoaded ||
+                    !ContainsIdentity(identities, state.identity))
+                {
+                    trackedObjects.RemoveAt(i);
+                }
+            }
+
+            foreach (LiveLinkIdentity identity in identities)
+            {
+                if (identity == null ||
+                    !identity.gameObject.scene.IsValid() ||
+                    !identity.gameObject.scene.isLoaded ||
+                    string.IsNullOrEmpty(identity.ObjectId))
+                    continue;
+
+                if (FindTrackedState(identity) == null)
+                    trackedObjects.Add(CreateTrackedState(identity));
+            }
+        }
+
+        private static bool ContainsIdentity(
+            LiveLinkIdentity[] identities,
+            LiveLinkIdentity target)
+        {
+            foreach (LiveLinkIdentity identity in identities)
+            {
+                if (identity == target)
+                    return true;
+            }
+            return false;
+        }
+
+        private TrackedObjectState FindTrackedState(LiveLinkIdentity identity)
+        {
+            foreach (TrackedObjectState state in trackedObjects)
+            {
+                if (state.identity == identity)
+                    return state;
+            }
+            return null;
+        }
+
+        private TrackedObjectState CreateTrackedState(LiveLinkIdentity identity)
+        {
+            TrackedObjectState state = new TrackedObjectState
+            {
+                identity = identity,
+                position = identity.transform.localPosition,
+                rotation = identity.transform.localRotation,
+                scale = identity.transform.localScale
+            };
+            CaptureTrackedLight(state);
+            CaptureTrackedMaterials(state);
+            return state;
+        }
+
+        private void DetectTrackedObjectChanges(
+            TrackedObjectState state,
+            double now)
+        {
+            if (state.identity == null)
+                return;
+
+            Transform transform = state.identity.transform;
+            if (transform.localPosition != state.position ||
+                Quaternion.Angle(transform.localRotation, state.rotation) > 0.01f ||
+                transform.localScale != state.scale)
+            {
+                state.position = transform.localPosition;
+                state.rotation = transform.localRotation;
+                state.scale = transform.localScale;
+                QueueTrackedChange(state, transformChange: true);
+            }
+
+            Light currentLight = state.identity.GetComponent<Light>();
+            if (currentLight != state.light)
+            {
+                CaptureTrackedLight(state);
+                return;
+            }
+
+            if (currentLight != null &&
+                (currentLight.enabled != state.lightEnabled ||
+                 !Mathf.Approximately(currentLight.intensity, state.lightIntensity) ||
+                 currentLight.color != state.lightColor ||
+                 !Mathf.Approximately(currentLight.range, state.lightRange) ||
+                 !Mathf.Approximately(currentLight.spotAngle, state.lightSpotAngle)))
+            {
+                CaptureTrackedLight(state);
+                QueueTrackedChange(state, lightChange: true);
+            }
+
+            Renderer currentRenderer = state.identity.GetComponent<Renderer>();
+            if (currentRenderer != state.renderer)
+            {
+                CaptureTrackedMaterials(state);
+                return;
+            }
+
+            if (currentRenderer == null)
+                return;
+
+            Material[] materials = currentRenderer.sharedMaterials;
+            if (materials.Length != state.materialSnapshots.Length)
+            {
+                CaptureTrackedMaterials(state);
+                return;
+            }
+
+            bool materialChanged = false;
+            foreach (int i in state.pendingMaterialSlots)
+            {
+                if (i < 0 || i >= materials.Length)
+                    continue;
+
+                Material material = materials[i];
+                MaterialSnapshot snapshot = state.materialSnapshots[i];
+                if (material != snapshot.material)
+                {
+                    CaptureTrackedMaterials(state);
+                    return;
+                }
+
+                if (material == null)
+                    continue;
+
+                if (ReadMaterialColor(material) != snapshot.color ||
+                    !Mathf.Approximately(ReadMaterialFloat(material, "_Metallic", 0f), snapshot.metallic) ||
+                    !Mathf.Approximately(ReadMaterialSmoothness(material), snapshot.smoothness) ||
+                    ReadMaterialColor(material, "_EmissionColor") != snapshot.emission)
+                {
+                    materialChanged = true;
+                    if (!state.pendingMaterialSlots.Contains(i))
+                        state.pendingMaterialSlots.Add(i);
+                }
+            }
+
+            if (materialChanged)
+            {
+                CaptureTrackedMaterials(state);
+                QueueTrackedChange(state, materialChange: true);
+            }
+        }
+
+        private void QueueTrackedChange(
+            TrackedObjectState state,
+            bool transformChange = false,
+            bool lightChange = false,
+            bool materialChange = false)
+        {
+            state.pendingTransform |= transformChange;
+            state.pendingLight |= lightChange;
+            state.pendingMaterial |= materialChange;
+            state.pendingDeadline =
+                EditorApplication.timeSinceStartup + AutoSyncDebounceSeconds;
+        }
+
+        private void CaptureTrackedLight(TrackedObjectState state)
+        {
+            state.light = state.identity.GetComponent<Light>();
+            state.lightIndex = state.light == null ? -1 : 0;
+            if (state.light == null)
+                return;
+
+            state.lightEnabled = state.light.enabled;
+            state.lightIntensity = state.light.intensity;
+            state.lightColor = state.light.color;
+            state.lightRange = state.light.range;
+            state.lightSpotAngle = state.light.spotAngle;
+        }
+
+        private void CaptureTrackedMaterials(TrackedObjectState state)
+        {
+            state.renderer = state.identity.GetComponent<Renderer>();
+            state.rendererIndex = state.renderer == null ? -1 : 0;
+            state.materials = state.renderer == null
+                ? Array.Empty<Material>()
+                : state.renderer.sharedMaterials;
+            state.materialSnapshots = new MaterialSnapshot[state.materials.Length];
+
+            for (int i = 0; i < state.materials.Length; i++)
+            {
+                Material material = state.materials[i];
+                state.materialSnapshots[i] = new MaterialSnapshot
+                {
+                    material = material,
+                    color = ReadMaterialColor(material),
+                    metallic = ReadMaterialFloat(material, "_Metallic", 0f),
+                    smoothness = ReadMaterialSmoothness(material),
+                    emission = ReadMaterialColor(material, "_EmissionColor")
+                };
+            }
+        }
+
+        private static float ReadMaterialSmoothness(Material material)
+        {
+            return material != null && material.HasProperty("_Smoothness")
+                ? material.GetFloat("_Smoothness")
+                : ReadMaterialFloat(material, "_Glossiness", 0f);
+        }
+
+        private void SendTransformFor(TrackedObjectState state)
+        {
+            Transform transform = state.identity.transform;
+            LiveLinkCompatibilityManager.TrySendTransform(new LiveLinkCommand
+            {
+                type = "TRANSFORM",
+                objectId = state.identity.ObjectId,
+                position = transform.localPosition,
+                rotation = transform.localEulerAngles,
+                scale = transform.localScale
+            }, out _);
+        }
+
+        private void SendLightFor(TrackedObjectState state)
+        {
+            if (state.light == null)
+                return;
+
+            LiveLinkCompatibilityManager.TrySendLight(new LiveLinkCommand
+            {
+                type = "LIGHT_UPDATE",
+                objectId = state.identity.ObjectId,
+                lightComponentIndex = state.lightIndex,
+                light = new LiveLinkLightState
+                {
+                    enabled = state.light.enabled,
+                    intensity = state.light.intensity,
+                    color = state.light.color,
+                    range = state.light.range,
+                    spotAngle = state.light.spotAngle
+                }
+            }, out _);
+        }
+
+        private void SendMaterialFor(TrackedObjectState state)
+        {
+            if (state.renderer == null)
+                return;
+
+            Material[] materials = state.renderer.sharedMaterials;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                Material material = materials[i];
+                if (material == null)
+                    continue;
+
+                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    "BaseColor", new LiveLinkMaterialState
+                    {
+                        color = ReadMaterialColor(material)
+                    });
+                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    "Metallic", new LiveLinkMaterialState
+                    {
+                        value = ReadMaterialFloat(material, "_Metallic", 0f)
+                    });
+                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    "Smoothness", new LiveLinkMaterialState
+                    {
+                        value = ReadMaterialSmoothness(material)
+                    });
+
+                if (material.HasProperty("_EmissionColor"))
+                {
+                    SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                        "EmissionColor", new LiveLinkMaterialState
+                        {
+                            color = material.GetColor("_EmissionColor")
+                        });
+                }
+            }
+        }
+
+        private static void SendMaterialPropertyFor(
+            LiveLinkIdentity identity,
+            int rendererIndex,
+            int materialSlot,
+            Material material,
+            string property,
+            LiveLinkMaterialState materialState)
+        {
+            LiveLinkCompatibilityManager.TrySendMaterial(new LiveLinkCommand
+            {
+                type = "MATERIAL_UPDATE",
+                objectId = identity.ObjectId,
+                rendererComponentIndex = rendererIndex,
+                materialSlot = materialSlot,
+                materialProperty = property,
+                material = materialState
+            }, out _);
         }
 
         private void SendLight()
@@ -199,6 +789,61 @@ namespace LiveLink.Editor
             }
 
             Repaint();
+        }
+
+        private void SendMaterial()
+        {
+            if (selectedTarget == null || selectedRenderer == null ||
+                selectedMaterial == null)
+                return;
+
+            SendMaterialProperty("BaseColor", new LiveLinkMaterialState
+            {
+                color = ReadMaterialColor(selectedMaterial)
+            });
+            SendMaterialProperty("Metallic", new LiveLinkMaterialState
+            {
+                value = ReadMaterialFloat(selectedMaterial, "_Metallic", 0f)
+            });
+            SendMaterialProperty("Smoothness", new LiveLinkMaterialState
+            {
+                value = selectedMaterial.HasProperty("_Smoothness")
+                    ? selectedMaterial.GetFloat("_Smoothness")
+                    : ReadMaterialFloat(selectedMaterial, "_Glossiness", 0f)
+            });
+
+            if (selectedMaterial.HasProperty("_EmissionColor"))
+                SendMaterialProperty("EmissionColor", new LiveLinkMaterialState
+                {
+                    color = selectedMaterial.GetColor("_EmissionColor")
+                });
+
+            lastResponse = "Material sent to compatible Player.";
+            Repaint();
+        }
+
+        private void SendMaterialProperty(
+            string property,
+            LiveLinkMaterialState state)
+        {
+            var command = new LiveLinkCommand
+            {
+                type = "MATERIAL_UPDATE",
+                objectId = selectedTarget.ObjectId,
+                rendererComponentIndex = selectedRendererIndex,
+                materialSlot = selectedMaterialSlot,
+                materialProperty = property,
+                material = state
+            };
+
+            if (!LiveLinkCompatibilityManager.TrySendMaterial(
+                    command, out string diagnostic))
+            {
+                lastResponse = "Material sync blocked: " +
+                    (string.IsNullOrEmpty(diagnostic)
+                        ? "Player authorization has not been verified."
+                        : diagnostic);
+            }
         }
 
         private void RefreshNetworkConfiguration()
@@ -407,6 +1052,22 @@ namespace LiveLink.Editor
             autoSync = EditorGUILayout.Toggle(
                 "Automatic Sync", autoSync);
 
+            TrackingScope previousTrackingScope = trackingScope;
+            trackingScope = (TrackingScope)EditorGUILayout.EnumPopup(
+                "Tracking Scope", trackingScope);
+            if (previousTrackingScope != trackingScope)
+            {
+                ClearPendingAutomaticSync();
+                trackedObjects.Clear();
+                Repaint();
+            }
+            if (trackingScope == TrackingScope.AllValidLiveLinkObjects)
+            {
+                EditorGUILayout.LabelField(
+                    "Tracked LiveLink Objects",
+                    trackedObjects.Count.ToString());
+            }
+
             if (GUILayout.Button("PING Player"))
             {
                 Send(new LiveLinkCommand
@@ -464,6 +1125,29 @@ namespace LiveLink.Editor
                 if (selectedLight != null &&
                     GUILayout.Button("Sync Light Now"))
                     SendLight();
+
+                if (selectedMaterial != null &&
+                    GUILayout.Button("Sync Material Now"))
+                    SendMaterial();
+
+                if (selectedRenderer != null)
+                {
+                    Material[] materials = selectedRenderer.sharedMaterials;
+                    if (materials.Length > 1)
+                    {
+                        int previousSlot = selectedMaterialSlot;
+                        selectedMaterialSlot = EditorGUILayout.IntSlider(
+                            "Material Slot",
+                            selectedMaterialSlot,
+                            0,
+                            materials.Length - 1);
+                        if (previousSlot != selectedMaterialSlot)
+                        {
+                            ClearPendingAutomaticSync();
+                            CaptureMaterial();
+                        }
+                    }
+                }
             }
         }
     }

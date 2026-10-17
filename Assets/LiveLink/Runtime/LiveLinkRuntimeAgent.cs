@@ -102,6 +102,10 @@ private void OnDisable()
                         ApplyLight(cmd);
                         break;
 
+                    case "MATERIAL_UPDATE":
+                        ApplyMaterial(cmd);
+                        break;
+
                     default:
                         Reply("ERROR", "Unknown command");
                         break;
@@ -256,6 +260,91 @@ private void OnDisable()
                 target.spotAngle = command.light.spotAngle;
 
             Reply("OK", "Updated Light: " + command.objectId,
+                null, command.requestId);
+        }
+
+        private void ApplyMaterial(LiveLinkCommand command)
+        {
+            if (!transformAuthorizationGranted)
+            {
+                Reply("ERROR",
+                    "Material synchronization is not authorized for this build.",
+                    null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkMaterialStateValidator.TryValidate(
+                    command.materialProperty,
+                    command.material,
+                    out string validationError))
+            {
+                Reply("ERROR", validationError, null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkObjectRegistry.TryGet(
+                    command.objectId, out var identity, out var error))
+            {
+                Reply("ERROR", error, null, command.requestId);
+                return;
+            }
+
+            Renderer[] renderers = identity.GetComponents<Renderer>();
+            if (command.rendererComponentIndex < 0 ||
+                command.rendererComponentIndex >= renderers.Length)
+            {
+                Reply("ERROR", "Renderer component index is invalid.",
+                    null, command.requestId);
+                return;
+            }
+
+            Renderer target = renderers[command.rendererComponentIndex];
+            Material[] materials = target.sharedMaterials;
+            if (command.materialSlot < 0 ||
+                command.materialSlot >= materials.Length ||
+                materials[command.materialSlot] == null)
+            {
+                Reply("ERROR", "Material slot is invalid or empty.",
+                    null, command.requestId);
+                return;
+            }
+
+            Material source = materials[command.materialSlot];
+            int propertyId;
+            if (command.materialProperty == "BaseColor")
+                propertyId = source.HasProperty("_BaseColor")
+                    ? Shader.PropertyToID("_BaseColor")
+                    : source.HasProperty("_Color")
+                        ? Shader.PropertyToID("_Color") : -1;
+            else if (command.materialProperty == "Metallic")
+                propertyId = source.HasProperty("_Metallic")
+                    ? Shader.PropertyToID("_Metallic") : -1;
+            else if (command.materialProperty == "Smoothness")
+                propertyId = source.HasProperty("_Smoothness")
+                    ? Shader.PropertyToID("_Smoothness")
+                    : source.HasProperty("_Glossiness")
+                        ? Shader.PropertyToID("_Glossiness") : -1;
+            else
+                propertyId = source.HasProperty("_EmissionColor")
+                    ? Shader.PropertyToID("_EmissionColor") : -1;
+
+            if (propertyId < 0)
+            {
+                Reply("ERROR", "The selected shader does not support " +
+                    command.materialProperty + ".", null, command.requestId);
+                return;
+            }
+
+            MaterialPropertyBlock block = new MaterialPropertyBlock();
+            target.GetPropertyBlock(block, command.materialSlot);
+            if (command.materialProperty == "BaseColor" ||
+                command.materialProperty == "EmissionColor")
+                block.SetColor(propertyId, command.material.color);
+            else
+                block.SetFloat(propertyId, command.material.value);
+            target.SetPropertyBlock(block, command.materialSlot);
+
+            Reply("OK", "Updated Material: " + command.objectId,
                 null, command.requestId);
         }
 

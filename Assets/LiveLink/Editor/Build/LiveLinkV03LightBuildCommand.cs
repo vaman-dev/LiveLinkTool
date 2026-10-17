@@ -8,21 +8,24 @@ using UnityEngine;
 
 namespace LiveLink.Editor.Build
 {
-    public static class LiveLinkV03LightBuildCommand
+    public static class LiveLinkV03MaterialBuildCommand
     {
         private const string OutputPath =
-            "Builds/Development/LiveLink_v0.3_Light.exe";
+            "Builds/Development/LiveLink_v0.3_Material.exe";
 
-        [MenuItem("Tools/LiveLink/Build v0.3 Light Development Player")]
-        public static void BuildLightPlayer()
+        [MenuItem("Tools/LiveLink/Build v0.3 Material Development Player")]
+        public static void BuildMaterialPlayer()
         {
             string projectRoot =
                 Directory.GetParent(Application.dataPath).FullName;
             string outputPath = Path.Combine(projectRoot, OutputPath);
-            Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
+            string developmentDirectory =
+                Path.GetDirectoryName(outputPath);
 
             try
             {
+                CleanDevelopmentDirectory(developmentDirectory);
+                Directory.CreateDirectory(developmentDirectory);
                 LiveLinkBuildValidator.ValidateBuildScenes();
 
                 string[] scenes = EditorBuildSettings.scenes
@@ -44,16 +47,28 @@ namespace LiveLink.Editor.Build
                 if (report.summary.result != BuildResult.Succeeded)
                 {
                     throw new BuildFailedException(
-                        "[LiveLink] v0.3 Light Development Player build failed.");
+                        "[LiveLink] v0.3 Material Development Player build failed.");
                 }
 
-                Debug.Log("[LiveLink] v0.3 Light Development Player built: " +
+                Debug.Log("[LiveLink] v0.3 Material Development Player built: " +
                     outputPath);
             }
             finally
             {
                 LiveLinkManifestBaker.Cleanup();
             }
+        }
+
+        private static void CleanDevelopmentDirectory(string directory)
+        {
+            if (!Directory.Exists(directory))
+                return;
+
+            foreach (string file in Directory.GetFiles(directory))
+                File.Delete(file);
+
+            foreach (string childDirectory in Directory.GetDirectories(directory))
+                Directory.Delete(childDirectory, true);
         }
     }
 }

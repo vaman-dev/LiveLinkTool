@@ -28,6 +28,10 @@ namespace LiveLink
         public Vector3 scale;
         public int lightComponentIndex;
         public LiveLinkLightState light;
+        public int rendererComponentIndex;
+        public int materialSlot;
+        public string materialProperty;
+        public LiveLinkMaterialState material;
     }
 
     [Serializable]
@@ -99,6 +103,69 @@ namespace LiveLink
                 !IsFinite(state.color.a))
             {
                 error = "Light color must contain finite values.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+    }
+
+    [Serializable]
+    public sealed class LiveLinkMaterialState
+    {
+        public Color color;
+        public float value;
+    }
+
+    public static class LiveLinkMaterialStateValidator
+    {
+        public static bool IsSupportedProperty(string property)
+        {
+            return property == "BaseColor" ||
+                property == "Metallic" ||
+                property == "Smoothness" ||
+                property == "EmissionColor";
+        }
+
+        public static bool TryValidate(
+            string property,
+            LiveLinkMaterialState state,
+            out string error)
+        {
+            error = null;
+
+            if (!IsSupportedProperty(property))
+            {
+                error = "Material property is not supported.";
+                return false;
+            }
+
+            if (state == null)
+            {
+                error = "Material state is missing.";
+                return false;
+            }
+
+            if (property == "BaseColor" || property == "EmissionColor")
+            {
+                if (!IsFinite(state.color.r) ||
+                    !IsFinite(state.color.g) ||
+                    !IsFinite(state.color.b) ||
+                    !IsFinite(state.color.a))
+                {
+                    error = "Material color must contain finite values.";
+                    return false;
+                }
+            }
+            else if (!IsFinite(state.value) ||
+                state.value < 0f || state.value > 1f)
+            {
+                error = "Material numeric values must be between 0 and 1.";
                 return false;
             }
 

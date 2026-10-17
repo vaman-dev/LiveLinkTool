@@ -16,7 +16,8 @@ namespace LiveLink.Diagnostics
         ManifestCompatible,
         SyncAuthorizationAcknowledged,
         TransformCommandAcknowledged,
-        LightCommandAcknowledged
+        LightCommandAcknowledged,
+        MaterialCommandAcknowledged
     }
     public enum LiveLinkDiagnosticResult { Pass, Fail, Pending, NotTested, NotApplicable }
 

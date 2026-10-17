@@ -164,7 +164,8 @@ namespace LiveLink.Diagnostics
         { return snapshot.Stages.Where(s => s.Result != LiveLinkDiagnosticResult.NotApplicable &&
             s.Stage != LiveLinkDiagnosticStage.SyncAuthorizationAcknowledged &&
             s.Stage != LiveLinkDiagnosticStage.TransformCommandAcknowledged &&
-            s.Stage != LiveLinkDiagnosticStage.LightCommandAcknowledged); }
+            s.Stage != LiveLinkDiagnosticStage.LightCommandAcknowledged &&
+            s.Stage != LiveLinkDiagnosticStage.MaterialCommandAcknowledged); }
 
         private static void Mark(string id, LiveLinkDiagnosticStage stage,
             LiveLinkDiagnosticResult result, string detail)

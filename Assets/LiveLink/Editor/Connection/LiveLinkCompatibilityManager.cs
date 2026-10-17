@@ -251,6 +251,88 @@ namespace LiveLink.Editor.Connection
             return discoverySent;
         }
 
+        public static bool TrySendMaterial(
+            LiveLinkCommand command,
+            out string diagnostic)
+        {
+            diagnostic = null;
+
+            if (command == null || command.type != "MATERIAL_UPDATE")
+            {
+                diagnostic = "Only MATERIAL_UPDATE commands can be authorized.";
+                return false;
+            }
+
+            if (!LiveLinkMaterialStateValidator.TryValidate(
+                    command.materialProperty,
+                    command.material,
+                    out diagnostic))
+                return false;
+
+            if (string.IsNullOrEmpty(command.requestId))
+                command.requestId = Guid.NewGuid().ToString("N");
+
+            var playerConnections = sessions.Values
+                .Where(session =>
+                    session.Snapshot.Key.Transport ==
+                    LiveLinkTransportKind.PlayerConnection &&
+                    session.Snapshot.State !=
+                    LiveLinkCompatibilityState.Disconnected)
+                .ToArray();
+
+            if (playerConnections.Length > 0)
+            {
+                bool sent = false;
+                foreach (Session session in playerConnections)
+                {
+                    if (!IsCompatible(session.Snapshot.Key))
+                    {
+                        diagnostic = session.Snapshot.Diagnostic;
+                        continue;
+                    }
+
+                    TrackCommand(session, command);
+                    sent |= EditorConnection.instance.TrySend(
+                        LiveLinkProtocol.CommandId,
+                        System.Text.Encoding.UTF8.GetBytes(
+                            JsonUtility.ToJson(command)),
+                        int.Parse(session.Snapshot.Key.ConnectionId));
+                }
+
+                if (!sent && string.IsNullOrEmpty(diagnostic))
+                    diagnostic = "No compatible PlayerConnection session.";
+                return sent;
+            }
+
+            bool discoverySent = false;
+            var discoveryConnections = sessions.Values
+                .Where(session =>
+                    session.Snapshot.Key.Transport ==
+                    LiveLinkTransportKind.DiscoveryTcp &&
+                    session.Snapshot.State !=
+                    LiveLinkCompatibilityState.Disconnected)
+                .ToArray();
+
+            foreach (Session session in discoveryConnections)
+            {
+                if (!IsCompatible(session.Snapshot.Key))
+                {
+                    diagnostic = session.Snapshot.Diagnostic;
+                    continue;
+                }
+
+                TrackCommand(session, command);
+                discoverySent |= LiveLinkDiscoveryService.TrySendTo(
+                    int.Parse(session.Snapshot.Key.ConnectionId), command);
+            }
+
+            if (!discoverySent && string.IsNullOrEmpty(diagnostic))
+                diagnostic = discoveryConnections.Length == 0
+                    ? "No connected Player session."
+                    : "No compatible discovery session.";
+            return discoverySent;
+        }
+
         private static void TrackCommand(Session session, LiveLinkCommand command)
         {
             session.PendingCommandRequestId = command.requestId;
@@ -262,9 +344,11 @@ namespace LiveLink.Editor.Connection
 
         private static LiveLinkDiagnosticStage CommandAckStage(string type)
         {
-            return type == "LIGHT_UPDATE"
-                ? LiveLinkDiagnosticStage.LightCommandAcknowledged
-                : LiveLinkDiagnosticStage.TransformCommandAcknowledged;
+            if (type == "LIGHT_UPDATE")
+                return LiveLinkDiagnosticStage.LightCommandAcknowledged;
+            if (type == "MATERIAL_UPDATE")
+                return LiveLinkDiagnosticStage.MaterialCommandAcknowledged;
+            return LiveLinkDiagnosticStage.TransformCommandAcknowledged;
         }
 
         internal static void HandlePlayerConnectionResponse(
