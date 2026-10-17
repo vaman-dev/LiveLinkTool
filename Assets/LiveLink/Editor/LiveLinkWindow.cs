@@ -71,6 +71,8 @@ namespace LiveLink.Editor
         private float lastMaterialSmoothness;
         private Color lastMaterialEmission;
         private const double AutoSyncDebounceSeconds = 0.15;
+        private const string AutoSyncPreference = "LiveLink.AutomaticSync";
+        private const string TrackingScopePreference = "LiveLink.TrackingScope";
         private bool pendingLightSync;
         private bool pendingMaterialSync;
         private LiveLinkIdentity pendingSyncTarget;
@@ -100,6 +102,13 @@ namespace LiveLink.Editor
 
         private void OnEnable()
         {
+            autoSync = EditorPrefs.GetBool(AutoSyncPreference, true);
+            trackingScope = (TrackingScope)EditorPrefs.GetInt(
+                TrackingScopePreference,
+                (int)TrackingScope.SelectedObject);
+            if (!Enum.IsDefined(typeof(TrackingScope), trackingScope))
+                trackingScope = TrackingScope.SelectedObject;
+
             // Initialize session compatibility tracking before connections
             // begin delivering responses to this window.
             _ = LiveLinkCompatibilityManager.GetSessions();
@@ -185,12 +194,6 @@ namespace LiveLink.Editor
 
         private void CaptureTransform()
         {
-            if (trackingScope == TrackingScope.AllValidLiveLinkObjects)
-            {
-                DetectAllTrackedObjects();
-                return;
-            }
-
             if (selectedTarget == null)
                 return;
 
@@ -286,6 +289,12 @@ namespace LiveLink.Editor
             if (EditorApplication.timeSinceStartup >= nextNetworkRefresh)
             {
                 RefreshNetworkConfiguration();
+            }
+
+            if (trackingScope == TrackingScope.AllValidLiveLinkObjects)
+            {
+                DetectAllTrackedObjects();
+                return;
             }
 
             if (selectedTarget == null)
@@ -610,11 +619,11 @@ namespace LiveLink.Editor
             }
 
             bool materialChanged = false;
-            foreach (int i in state.pendingMaterialSlots)
+            // Detection must inspect every tracked material slot. The pending list
+            // is populated by this comparison and is intentionally only used by
+            // SendMaterialFor after a change has been found.
+            for (int i = 0; i < materials.Length; i++)
             {
-                if (i < 0 || i >= materials.Length)
-                    continue;
-
                 Material material = materials[i];
                 MaterialSnapshot snapshot = state.materialSnapshots[i];
                 if (material != snapshot.material)
@@ -741,48 +750,94 @@ namespace LiveLink.Editor
                 return;
 
             Material[] materials = state.renderer.sharedMaterials;
-            for (int i = 0; i < materials.Length; i++)
+            int affectedSlots = 0;
+            int queuedCommands = 0;
+            int blockedCommands = 0;
+            string firstDiagnostic = null;
+
+            foreach (int i in state.pendingMaterialSlots)
             {
+                if (i < 0 || i >= materials.Length)
+                    continue;
+
                 Material material = materials[i];
                 if (material == null)
                     continue;
 
-                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                affectedSlots++;
+
+                if (SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
                     "BaseColor", new LiveLinkMaterialState
                     {
                         color = ReadMaterialColor(material)
-                    });
-                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    }, out string diagnostic))
+                    queuedCommands++;
+                else
+                {
+                    blockedCommands++;
+                    firstDiagnostic ??= diagnostic;
+                }
+
+                if (SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
                     "Metallic", new LiveLinkMaterialState
                     {
                         value = ReadMaterialFloat(material, "_Metallic", 0f)
-                    });
-                SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    }, out diagnostic))
+                    queuedCommands++;
+                else
+                {
+                    blockedCommands++;
+                    firstDiagnostic ??= diagnostic;
+                }
+
+                if (SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
                     "Smoothness", new LiveLinkMaterialState
                     {
                         value = ReadMaterialSmoothness(material)
-                    });
+                    }, out diagnostic))
+                    queuedCommands++;
+                else
+                {
+                    blockedCommands++;
+                    firstDiagnostic ??= diagnostic;
+                }
 
                 if (material.HasProperty("_EmissionColor"))
                 {
-                    SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
+                    if (SendMaterialPropertyFor(state.identity, state.rendererIndex, i, material,
                         "EmissionColor", new LiveLinkMaterialState
                         {
                             color = material.GetColor("_EmissionColor")
-                        });
+                        }, out diagnostic))
+                        queuedCommands++;
+                    else
+                    {
+                        blockedCommands++;
+                        firstDiagnostic ??= diagnostic;
+                    }
                 }
             }
+
+            lastResponse = blockedCommands > 0
+                ? "Material automatic sync blocked: " +
+                  (string.IsNullOrEmpty(firstDiagnostic)
+                      ? "Player authorization has not been verified."
+                      : firstDiagnostic)
+                : "Material automatic sync queued " + queuedCommands +
+                  " command(s) for " + affectedSlots + " slot(s).";
+            Repaint();
         }
 
-        private static void SendMaterialPropertyFor(
+        private static bool SendMaterialPropertyFor(
             LiveLinkIdentity identity,
             int rendererIndex,
             int materialSlot,
             Material material,
             string property,
-            LiveLinkMaterialState materialState)
+            LiveLinkMaterialState materialState,
+            out string diagnostic)
         {
-            LiveLinkCompatibilityManager.TrySendMaterial(new LiveLinkCommand
+            bool sent = LiveLinkCompatibilityManager.TrySendMaterial(new LiveLinkCommand
             {
                 type = "MATERIAL_UPDATE",
                 objectId = identity.ObjectId,
@@ -790,7 +845,8 @@ namespace LiveLink.Editor
                 materialSlot = materialSlot,
                 materialProperty = property,
                 material = materialState
-            }, out _);
+            }, out diagnostic);
+            return sent;
         }
 
         private void SendLight()
@@ -1089,10 +1145,12 @@ namespace LiveLink.Editor
 
             autoSync = EditorGUILayout.Toggle(
                 "Automatic Sync", autoSync);
+            EditorPrefs.SetBool(AutoSyncPreference, autoSync);
 
             TrackingScope previousTrackingScope = trackingScope;
             trackingScope = (TrackingScope)EditorGUILayout.EnumPopup(
                 "Tracking Scope", trackingScope);
+            EditorPrefs.SetInt(TrackingScopePreference, (int)trackingScope);
             if (previousTrackingScope != trackingScope)
             {
                 ClearPendingAutomaticSync();
