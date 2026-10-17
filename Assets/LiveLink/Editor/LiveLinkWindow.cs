@@ -128,6 +128,7 @@ namespace LiveLink.Editor
 
         private void OnSelectionChanged()
         {
+            LiveLinkIdentity previousTarget = selectedTarget;
             ClearPendingAutomaticSync();
             selectedTarget = null;
 
@@ -139,10 +140,47 @@ namespace LiveLink.Editor
             }
 
             selectedMaterialSlot = 0;
+            if (selectedTarget == null &&
+                Selection.activeObject is Material selectedAsset &&
+                TryPinMaterialTarget(previousTarget, selectedAsset,
+                    out int materialSlot))
+            {
+                selectedTarget = previousTarget;
+                selectedMaterialSlot = materialSlot;
+            }
             CaptureTransform();
             CaptureLight();
             CaptureMaterial();
             Repaint();
+        }
+
+        private static bool TryPinMaterialTarget(
+            LiveLinkIdentity previousTarget,
+            Material selectedMaterialAsset,
+            out int materialSlot)
+        {
+            materialSlot = -1;
+            if (previousTarget == null || selectedMaterialAsset == null)
+                return false;
+
+            Renderer[] renderers = previousTarget.GetComponents<Renderer>();
+            foreach (Renderer renderer in renderers)
+            {
+                if (renderer == null)
+                    continue;
+
+                Material[] materials = renderer.sharedMaterials;
+                for (int i = 0; i < materials.Length; i++)
+                {
+                    if (materials[i] == selectedMaterialAsset)
+                    {
+                        materialSlot = i;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private void CaptureTransform()
