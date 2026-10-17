@@ -82,7 +82,6 @@ namespace LiveLink.Editor.Identity
         {
             if (IsValid)
             {
-                Debug.Log(prefix + " Identity validation passed.");
                 return;
             }
 

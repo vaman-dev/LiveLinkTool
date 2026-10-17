@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using LiveLink;
 using LiveLink.Editor.Identity;
+using LiveLink.Diagnostics;
 using UnityEditor;
 using UnityEditor.Networking.PlayerConnection;
 using UnityEngine;
@@ -44,6 +45,9 @@ namespace LiveLink.Editor.Connection
             internal int VerificationAttempts;
             internal string AuthorizationRequestId;
             internal bool TransformAuthorizationGranted;
+            internal string DiagnosticSessionId;
+            internal string PendingCommandRequestId;
+            internal string PendingCommandType;
         }
 
         static LiveLinkCompatibilityManager()
@@ -62,6 +66,17 @@ namespace LiveLink.Editor.Connection
 
         public static IReadOnlyList<SessionSnapshot> GetSessions()
         {
+            // A Player can connect before the LiveLink window or this static
+            // manager finishes subscribing to connection callbacks. Reconcile
+            // the native list so an already-connected Player is not invisible
+            // to the compatibility state machine and UI.
+            foreach (var connectedPlayer in EditorConnection.instance.ConnectedPlayers)
+            {
+                int playerId = connectedPlayer.playerId;
+                if (!playerSessions.ContainsKey(playerId))
+                    OnPlayerConnected(playerId);
+            }
+
             return sessions.Values.Select(session => session.Snapshot).ToArray();
         }
 
@@ -85,6 +100,9 @@ namespace LiveLink.Editor.Connection
                 return false;
             }
 
+            if (string.IsNullOrEmpty(command.requestId))
+                command.requestId = Guid.NewGuid().ToString("N");
+
             var playerConnections = sessions.Values
                 .Where(session =>
                     session.Snapshot.Key.Transport ==
@@ -106,6 +124,7 @@ namespace LiveLink.Editor.Connection
 
                     int playerId = int.Parse(
                         session.Snapshot.Key.ConnectionId);
+                    TrackCommand(session, command);
                     byte[] data = System.Text.Encoding.UTF8.GetBytes(
                         JsonUtility.ToJson(command));
                     sent |= EditorConnection.instance.TrySend(
@@ -139,6 +158,7 @@ namespace LiveLink.Editor.Connection
 
                 int playerId = int.Parse(
                     session.Snapshot.Key.ConnectionId);
+                TrackCommand(session, command);
                 discoverySent |= LiveLinkDiscoveryService.TrySendTo(
                     playerId,
                     command);
@@ -150,6 +170,101 @@ namespace LiveLink.Editor.Connection
                     : "No compatible discovery session.";
 
             return discoverySent;
+        }
+
+        public static bool TrySendLight(
+            LiveLinkCommand command,
+            out string diagnostic)
+        {
+            diagnostic = null;
+
+            if (command == null || command.type != "LIGHT_UPDATE")
+            {
+                diagnostic = "Only LIGHT_UPDATE commands can be authorized.";
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(command.requestId))
+                command.requestId = Guid.NewGuid().ToString("N");
+
+            byte[] data = System.Text.Encoding.UTF8.GetBytes(
+                JsonUtility.ToJson(command));
+
+            var playerConnections = sessions.Values
+                .Where(session =>
+                    session.Snapshot.Key.Transport ==
+                    LiveLinkTransportKind.PlayerConnection &&
+                    session.Snapshot.State !=
+                    LiveLinkCompatibilityState.Disconnected)
+                .ToArray();
+
+            if (playerConnections.Length > 0)
+            {
+                bool sent = false;
+                foreach (Session session in playerConnections)
+                {
+                    if (!IsCompatible(session.Snapshot.Key))
+                    {
+                        diagnostic = session.Snapshot.Diagnostic;
+                        continue;
+                    }
+
+                    TrackCommand(session, command);
+                    sent |= EditorConnection.instance.TrySend(
+                        LiveLinkProtocol.CommandId,
+                        data,
+                        int.Parse(session.Snapshot.Key.ConnectionId));
+                }
+
+                if (!sent && string.IsNullOrEmpty(diagnostic))
+                    diagnostic = "No compatible PlayerConnection session.";
+                return sent;
+            }
+
+            bool discoverySent = false;
+            var discoveryConnections = sessions.Values
+                .Where(session =>
+                    session.Snapshot.Key.Transport ==
+                    LiveLinkTransportKind.DiscoveryTcp &&
+                    session.Snapshot.State !=
+                    LiveLinkCompatibilityState.Disconnected)
+                .ToArray();
+
+            foreach (Session session in discoveryConnections)
+            {
+                if (!IsCompatible(session.Snapshot.Key))
+                {
+                    diagnostic = session.Snapshot.Diagnostic;
+                    continue;
+                }
+
+                TrackCommand(session, command);
+                discoverySent |= LiveLinkDiscoveryService.TrySendTo(
+                    int.Parse(session.Snapshot.Key.ConnectionId), command);
+            }
+
+            if (!discoverySent && string.IsNullOrEmpty(diagnostic))
+                diagnostic = discoveryConnections.Length == 0
+                    ? "No connected Player session."
+                    : "No compatible discovery session.";
+
+            return discoverySent;
+        }
+
+        private static void TrackCommand(Session session, LiveLinkCommand command)
+        {
+            session.PendingCommandRequestId = command.requestId;
+            session.PendingCommandType = command.type;
+            LiveLinkDiagnostics.Pending(session.DiagnosticSessionId,
+                CommandAckStage(command.type),
+                command.type + " sent; waiting for application acknowledgement.");
+        }
+
+        private static LiveLinkDiagnosticStage CommandAckStage(string type)
+        {
+            return type == "LIGHT_UPDATE"
+                ? LiveLinkDiagnosticStage.LightCommandAcknowledged
+                : LiveLinkDiagnosticStage.TransformCommandAcknowledged;
         }
 
         internal static void HandlePlayerConnectionResponse(
@@ -279,6 +394,14 @@ namespace LiveLink.Editor.Connection
                 playerId.ToString());
             discoverySessions[playerId] = key;
             Session session = CreateSession(key);
+            // SessionConnected is raised only after the real TCP proof has been
+            // verified by LiveLinkDiscoveryService.
+            LiveLinkDiagnostics.Pass(session.DiagnosticSessionId,
+                LiveLinkDiagnosticStage.TcpConnected,
+                "Authenticated TCP session established.");
+            LiveLinkDiagnostics.Pass(session.DiagnosticSessionId,
+                LiveLinkDiagnosticStage.HmacAuthenticated,
+                "Player HMAC proof was accepted for this session.");
             BeginVerification(session);
         }
 
@@ -314,6 +437,15 @@ namespace LiveLink.Editor.Connection
                     Diagnostic = "Session connected; manifest not verified."
                 }
             };
+            session.DiagnosticSessionId = LiveLinkDiagnostics.BeginSession(
+                key.Transport == LiveLinkTransportKind.PlayerConnection
+                    ? LiveLinkDiagnosticRole.Editor : LiveLinkDiagnosticRole.Editor,
+                key.Transport == LiveLinkTransportKind.PlayerConnection
+                    ? LiveLinkDiagnosticTransport.PlayerConnection
+                    : LiveLinkDiagnosticTransport.DiscoveryTcp,
+                key.Transport + "-" + key.ConnectionId + "-g" + key.Generation,
+                key.ConnectionId,
+                LiveLinkDiagnosticRecordKind.LiveLinkSession);
             sessions[key] = session;
             return session;
         }
@@ -369,6 +501,41 @@ namespace LiveLink.Editor.Connection
             if (!sessions.TryGetValue(key, out Session session))
                 return;
 
+            if (session.Snapshot.State == LiveLinkCompatibilityState.Compatible &&
+                response.requestId == session.AuthorizationRequestId)
+            {
+                if (response.status == "OK" && response.message == "SYNC_AUTHORIZED")
+                {
+                    session.TransformAuthorizationGranted = true;
+                    LiveLinkDiagnostics.Pass(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.SyncAuthorizationAcknowledged,
+                        "SYNC_AUTHORIZATION acknowledged for the current session.");
+                }
+                else
+                {
+                    session.TransformAuthorizationGranted = false;
+                    LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.SyncAuthorizationAcknowledged,
+                        "SYNC_AUTHORIZATION rejected: " + response.message);
+                }
+                return;
+            }
+
+            if (response.requestId == session.PendingCommandRequestId)
+            {
+                if (response.status == "OK")
+                    LiveLinkDiagnostics.Pass(session.DiagnosticSessionId,
+                        CommandAckStage(session.PendingCommandType),
+                        session.PendingCommandType + " applied successfully.");
+                else
+                    LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                        CommandAckStage(session.PendingCommandType),
+                        session.PendingCommandType + " rejected: " + response.message);
+                session.PendingCommandRequestId = null;
+                session.PendingCommandType = null;
+                return;
+            }
+
             if (session.Snapshot.State !=
                     LiveLinkCompatibilityState.Checking ||
                 string.IsNullOrEmpty(response.requestId) ||
@@ -384,6 +551,9 @@ namespace LiveLink.Editor.Connection
                     LiveLinkCompatibilityState.VerificationFailed;
                 session.Snapshot.Diagnostic =
                     "Manifest response did not contain a fingerprint.";
+                LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                    LiveLinkDiagnosticStage.ManifestCompatible,
+                    session.Snapshot.Diagnostic);
                 return;
             }
 
@@ -402,18 +572,30 @@ namespace LiveLink.Editor.Connection
                 case LiveLinkCompatibilityState.Incompatible:
                     session.Snapshot.Diagnostic =
                         "Unsupported LiveLink protocol version.";
+                    LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.ManifestCompatible,
+                        session.Snapshot.Diagnostic);
                     break;
                 case LiveLinkCompatibilityState.VerificationFailed:
                     session.Snapshot.Diagnostic =
                         "Manifest fingerprint is malformed.";
+                    LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.ManifestCompatible,
+                        session.Snapshot.Diagnostic);
                     break;
                 case LiveLinkCompatibilityState.Mismatch:
                     session.Snapshot.Diagnostic =
                         "Player identity manifest differs from the Editor.";
+                    LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.ManifestCompatible,
+                        session.Snapshot.Diagnostic);
                     break;
                 case LiveLinkCompatibilityState.Compatible:
                     session.Snapshot.Diagnostic =
                         "Player identity manifest matches the Editor.";
+                    LiveLinkDiagnostics.Pass(session.DiagnosticSessionId,
+                        LiveLinkDiagnosticStage.ManifestCompatible,
+                        session.Snapshot.Diagnostic);
                     BeginTransformAuthorization(session);
                     break;
             }
@@ -449,11 +631,14 @@ namespace LiveLink.Editor.Connection
                     command);
             }
 
-            session.TransformAuthorizationGranted = sent;
+            session.TransformAuthorizationGranted = false;
             if (!sent)
             {
                 session.Snapshot.Diagnostic =
                     "Manifest matched, but transform authorization could not be sent.";
+                LiveLinkDiagnostics.Fail(session.DiagnosticSessionId,
+                    LiveLinkDiagnosticStage.SyncAuthorizationAcknowledged,
+                    session.Snapshot.Diagnostic);
             }
         }
 
@@ -465,6 +650,8 @@ namespace LiveLink.Editor.Connection
             session.Snapshot.State = LiveLinkCompatibilityState.Disconnected;
             session.Snapshot.Diagnostic = "Connection closed.";
             session.TransformAuthorizationGranted = false;
+            LiveLinkDiagnostics.Disconnect(session.DiagnosticSessionId,
+                session.Snapshot.Diagnostic);
         }
 
         private static void RemovePlayerSession(int playerId)

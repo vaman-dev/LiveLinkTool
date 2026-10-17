@@ -98,6 +98,10 @@ private void OnDisable()
                         ApplyTransform(cmd);
                         break;
 
+                    case "LIGHT_UPDATE":
+                        ApplyLight(cmd);
+                        break;
+
                     default:
                         Reply("ERROR", "Unknown command");
                         break;
@@ -203,6 +207,57 @@ private void OnDisable()
 
             Reply("OK", "Updated: " + cmd.objectId, null, cmd.requestId);
 }
+
+        private void ApplyLight(LiveLinkCommand command)
+        {
+            if (!transformAuthorizationGranted)
+            {
+                Reply("ERROR",
+                    "Light synchronization is not authorized for this build.",
+                    null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkLightStateValidator.TryValidate(
+                    command.light, out string validationError))
+            {
+                Reply("ERROR", validationError, null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkObjectRegistry.TryGet(
+                    command.objectId, out var identity, out var error))
+            {
+                Reply("ERROR", error, null, command.requestId);
+                return;
+            }
+
+            Light[] lights = identity.GetComponents<Light>();
+            if (command.lightComponentIndex < 0 ||
+                command.lightComponentIndex >= lights.Length)
+            {
+                Reply("ERROR", "Light component index is invalid.",
+                    null, command.requestId);
+                return;
+            }
+
+            Light target = lights[command.lightComponentIndex];
+            target.enabled = command.light.enabled;
+            target.intensity = command.light.intensity;
+            target.color = command.light.color;
+
+            if (target.type == LightType.Point ||
+                target.type == LightType.Spot)
+            {
+                target.range = command.light.range;
+            }
+
+            if (target.type == LightType.Spot)
+                target.spotAngle = command.light.spotAngle;
+
+            Reply("OK", "Updated Light: " + command.objectId,
+                null, command.requestId);
+        }
 
 
         private void Reply(

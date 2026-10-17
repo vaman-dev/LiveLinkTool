@@ -15,6 +15,13 @@ namespace LiveLink.Editor
         private Vector3 lastPosition;
         private Quaternion lastRotation;
         private Vector3 lastScale;
+        private Light selectedLight;
+        private int selectedLightIndex;
+        private bool lastLightEnabled;
+        private float lastLightIntensity;
+        private Color lastLightColor;
+        private float lastLightRange;
+        private float lastLightSpotAngle;
         private bool autoSync = true;
         private string lastResponse = "Not connected";
         // Unity PlayerConnection IDs may be negative. Use a dedicated
@@ -73,6 +80,7 @@ namespace LiveLink.Editor
             }
 
             CaptureTransform();
+            CaptureLight();
             Repaint();
         }
 
@@ -86,6 +94,27 @@ namespace LiveLink.Editor
             lastPosition = t.localPosition;
             lastRotation = t.localRotation;
             lastScale = t.localScale;
+        }
+
+        private void CaptureLight()
+        {
+            selectedLight = null;
+            selectedLightIndex = -1;
+
+            if (selectedTarget == null)
+                return;
+
+            Light[] lights = selectedTarget.GetComponents<Light>();
+            if (lights.Length == 0)
+                return;
+
+            selectedLight = lights[0];
+            selectedLightIndex = 0;
+            lastLightEnabled = selectedLight.enabled;
+            lastLightIntensity = selectedLight.intensity;
+            lastLightColor = selectedLight.color;
+            lastLightRange = selectedLight.range;
+            lastLightSpotAngle = selectedLight.spotAngle;
         }
 
         private void OnEditorUpdate()
@@ -107,12 +136,69 @@ namespace LiveLink.Editor
                 t.localScale != lastScale;
 
             if (!changed)
+            {
+                if (selectedLight == null)
+                    return;
+
+                bool lightChanged =
+                    selectedLight.enabled != lastLightEnabled ||
+                    !Mathf.Approximately(
+                        selectedLight.intensity, lastLightIntensity) ||
+                    selectedLight.color != lastLightColor ||
+                    !Mathf.Approximately(
+                        selectedLight.range, lastLightRange) ||
+                    !Mathf.Approximately(
+                        selectedLight.spotAngle, lastLightSpotAngle);
+
+                if (!lightChanged)
+                    return;
+
+                CaptureLight();
+                if (autoSync && !EditorApplication.isPlaying)
+                    SendLight();
                 return;
+            }
 
             CaptureTransform();
 
             if (autoSync && !EditorApplication.isPlaying)
                 SendTransform();
+        }
+
+        private void SendLight()
+        {
+            if (selectedTarget == null || selectedLight == null)
+                return;
+
+            var command = new LiveLinkCommand
+            {
+                type = "LIGHT_UPDATE",
+                objectId = selectedTarget.ObjectId,
+                lightComponentIndex = selectedLightIndex,
+                light = new LiveLinkLightState
+                {
+                    enabled = selectedLight.enabled,
+                    intensity = selectedLight.intensity,
+                    color = selectedLight.color,
+                    range = selectedLight.range,
+                    spotAngle = selectedLight.spotAngle
+                }
+            };
+
+            if (!LiveLinkCompatibilityManager.TrySendLight(
+                    command, out string diagnostic))
+            {
+                lastResponse = "Light sync blocked: " +
+                    (string.IsNullOrEmpty(diagnostic)
+                        ? "Player authorization has not been verified."
+                        : diagnostic);
+            }
+            else
+            {
+                lastResponse = "Light sent to compatible Player.";
+            }
+
+            Repaint();
         }
 
         private void RefreshNetworkConfiguration()
@@ -267,8 +353,12 @@ namespace LiveLink.Editor
                 "Unity LiveLink MVP",
                 EditorStyles.boldLabel);
 
-            int connections =
-                EditorConnection.instance.ConnectedPlayers.Count;
+            // A PlayerConnection-only count reports zero when the Player is
+            // connected through the authenticated discovery/TCP fallback.
+            // The compatibility manager is the transport-neutral source of
+            // active sessions, so use it for the displayed connection count.
+            int connections = LiveLinkCompatibilityManager.GetSessions()
+                .Count(session => session.State != LiveLinkCompatibilityState.Disconnected);
 
             EditorGUILayout.LabelField(
                 "Connected Players",
@@ -370,6 +460,10 @@ namespace LiveLink.Editor
 
                 if (GUILayout.Button("Sync Transform Now"))
                     SendTransform();
+
+                if (selectedLight != null &&
+                    GUILayout.Button("Sync Light Now"))
+                    SendLight();
             }
         }
     }

@@ -3,10 +3,12 @@ using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using LiveLink;
+using LiveLink.Diagnostics;
 using UnityEditor;
 using UnityEngine;
 
@@ -24,6 +26,7 @@ namespace LiveLink.Editor.Connection
             internal string Challenge;
             internal bool Authenticated;
             internal DateTime AuthenticationDeadlineUtc;
+            internal string DiagnosticSessionId;
 
             internal Client(TcpClient tcp, int playerId)
             {
@@ -60,6 +63,19 @@ namespace LiveLink.Editor.Connection
         private static UdpClient broadcaster;
         private static double nextAnnouncement;
         private static bool started;
+        private static string listenerDiagnosticId;
+
+        internal static string ListenerStatus => started
+            ? "LISTENING on TCP " + LiveLinkDiscoverySettings.CommandPort
+            : "NOT LISTENING";
+        internal static string BroadcasterStatus => broadcaster != null
+            ? "READY on UDP " + LiveLinkDiscoverySettings.DiscoveryPort
+            : "NOT READY";
+
+        internal static void EnsureStarted()
+        {
+            if (!started) Start();
+        }
 
         internal static event Action<int> SessionConnected;
         internal static event Action<int> SessionDisconnected;
@@ -68,7 +84,34 @@ namespace LiveLink.Editor.Connection
         static LiveLinkDiscoveryService()
         {
             EditorApplication.update += Update;
+            AssemblyReloadEvents.beforeAssemblyReload += Stop;
+            EditorApplication.quitting += Stop;
             Start();
+        }
+
+        private static void Stop()
+        {
+            started = false;
+
+            if (!string.IsNullOrEmpty(listenerDiagnosticId))
+            {
+                LiveLinkDiagnostics.Disconnect(listenerDiagnosticId, "Discovery service stopped.");
+                listenerDiagnosticId = null;
+            }
+
+            try { listener?.Stop(); } catch { }
+            listener = null;
+
+            try { broadcaster?.Close(); } catch { }
+            broadcaster = null;
+
+            foreach (Client client in clients.Values)
+            {
+                try { client.Writer.Dispose(); } catch { }
+                try { client.Tcp.Close(); } catch { }
+            }
+
+            clients.Clear();
         }
 
         internal static bool TrySend(LiveLinkCommand command)
@@ -137,11 +180,23 @@ namespace LiveLink.Editor.Connection
                     EnableBroadcast = true
                 };
                 started = true;
+                listenerDiagnosticId = LiveLinkDiagnostics.BeginSession(
+                    LiveLinkDiagnosticRole.Editor,
+                    LiveLinkDiagnosticTransport.DiscoveryTcp,
+                    "editor-listener-" + Guid.NewGuid().ToString("N"),
+                    "0.0.0.0:" + LiveLinkDiscoverySettings.CommandPort,
+                    LiveLinkDiagnosticRecordKind.Service);
+                LiveLinkDiagnostics.Pass(listenerDiagnosticId,
+                    LiveLinkDiagnosticStage.TcpListenerStarted,
+                    "TCP listener bound successfully.");
                 Debug.Log("[LiveLink] Discovery service listening on TCP " +
                     LiveLinkDiscoverySettings.CommandPort);
             }
             catch (Exception exception)
             {
+                if (!string.IsNullOrEmpty(listenerDiagnosticId))
+                    LiveLinkDiagnostics.Fail(listenerDiagnosticId,
+                        LiveLinkDiagnosticStage.TcpListenerStarted, exception.Message);
                 Debug.LogWarning("[LiveLink] Discovery service unavailable: " +
                     exception.Message);
             }
@@ -193,6 +248,14 @@ namespace LiveLink.Editor.Connection
                 tcp.NoDelay = true;
                 int playerId = -Math.Abs(tcp.Client.RemoteEndPoint.GetHashCode());
                 var client = new Client(tcp, playerId);
+                client.DiagnosticSessionId = LiveLinkDiagnostics.BeginSession(
+                    LiveLinkDiagnosticRole.Editor,
+                    LiveLinkDiagnosticTransport.DiscoveryTcp,
+                    "tcp-" + playerId + "-" + Guid.NewGuid().ToString("N"),
+                    tcp.Client.RemoteEndPoint == null ? "TCP peer" : tcp.Client.RemoteEndPoint.ToString(),
+                    LiveLinkDiagnosticRecordKind.TcpConnection);
+                LiveLinkDiagnostics.Pass(client.DiagnosticSessionId,
+                    LiveLinkDiagnosticStage.TcpConnected, "Accepted TCP connection.");
                 clients[playerId] = client;
                 BeginAuthentication(client);
 
@@ -324,6 +387,9 @@ namespace LiveLink.Editor.Connection
             }
 
             client.Authenticated = true;
+            LiveLinkDiagnostics.Pass(client.DiagnosticSessionId,
+                LiveLinkDiagnosticStage.HmacAuthenticated,
+                "Player proof verified for this TCP session.");
             SendToClient(client, new LiveLinkCommand
             {
                 requestId = Guid.NewGuid().ToString("N"),
@@ -359,6 +425,8 @@ namespace LiveLink.Editor.Connection
                 LiveLinkDiscoverySettings.CommandPort;
             byte[] data = Encoding.UTF8.GetBytes(message);
 
+            bool sent = false;
+            string sendDetail = "Global broadcast succeeded.";
             try
             {
                 broadcaster.Send(
@@ -366,11 +434,85 @@ namespace LiveLink.Editor.Connection
                     data.Length,
                     new IPEndPoint(IPAddress.Broadcast,
                         LiveLinkDiscoverySettings.DiscoveryPort));
+                sent = true;
             }
-            catch (Exception exception)
+            catch
             {
-                Debug.LogWarning("[LiveLink] Discovery broadcast failed: " +
-                    exception.Message);
+                // Some Windows/Wi-Fi adapters reject 255.255.255.255. Fall
+                // back to the directed broadcast for the selected subnet.
+                sendDetail = "Global broadcast failed; trying directed subnet broadcast.";
+            }
+
+            if (!sent &&
+                IPAddress.TryParse(address, out IPAddress selectedAddress))
+            {
+                foreach (NetworkInterface networkInterface in
+                         NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (networkInterface.OperationalStatus !=
+                        OperationalStatus.Up)
+                    {
+                        continue;
+                    }
+
+                    IPInterfaceProperties properties =
+                        networkInterface.GetIPProperties();
+
+                    foreach (UnicastIPAddressInformation unicast in
+                             properties.UnicastAddresses)
+                    {
+                        if (!unicast.Address.Equals(selectedAddress) ||
+                            unicast.IPv4Mask == null)
+                        {
+                            continue;
+                        }
+
+                        byte[] ip = selectedAddress.GetAddressBytes();
+                        byte[] mask = unicast.IPv4Mask.GetAddressBytes();
+                        byte[] broadcast = new byte[4];
+                        for (int i = 0; i < broadcast.Length; i++)
+                            broadcast[i] = (byte)(ip[i] | ~mask[i]);
+
+                        try
+                        {
+                            broadcaster.Send(
+                                data,
+                                data.Length,
+                                new IPEndPoint(
+                                    new IPAddress(broadcast),
+                                    LiveLinkDiscoverySettings.DiscoveryPort));
+                            sent = true;
+                            sendDetail = "Directed subnet broadcast succeeded.";
+                        }
+                        catch (Exception exception)
+                        {
+                            Debug.LogWarning(
+                                "[LiveLink] Directed discovery broadcast failed: " +
+                                exception.Message);
+                        }
+
+                        break;
+                    }
+
+                    if (sent)
+                        break;
+                }
+            }
+
+            if (!sent)
+            {
+                if (!string.IsNullOrEmpty(listenerDiagnosticId))
+                    LiveLinkDiagnostics.Fail(listenerDiagnosticId,
+                        LiveLinkDiagnosticStage.UdpAnnouncementSent,
+                        "No UDP discovery destination accepted the announcement.");
+                Debug.LogWarning(
+                    "[LiveLink] Discovery broadcast failed for the selected network.");
+            }
+            else if (!string.IsNullOrEmpty(listenerDiagnosticId))
+            {
+                LiveLinkDiagnostics.Pass(listenerDiagnosticId,
+                    LiveLinkDiagnosticStage.UdpAnnouncementSent,
+                    sendDetail + " Editor IPv4 " + address + ".");
             }
         }
 
@@ -381,6 +523,7 @@ namespace LiveLink.Editor.Connection
 
             try { client.Writer.Dispose(); } catch { }
             try { client.Tcp.Close(); } catch { }
+            LiveLinkDiagnostics.Disconnect(client.DiagnosticSessionId, "TCP session closed.");
             mainThreadActions.Enqueue(() => SessionDisconnected?.Invoke(playerId));
         }
     }

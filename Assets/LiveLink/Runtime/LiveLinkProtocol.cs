@@ -26,6 +26,8 @@ namespace LiveLink
         public Vector3 position;
         public Vector3 rotation;
         public Vector3 scale;
+        public int lightComponentIndex;
+        public LiveLinkLightState light;
     }
 
     [Serializable]
@@ -46,5 +48,66 @@ namespace LiveLink
         public int protocolVersion;
         public string fingerprint;
         public string buildName;
+    }
+
+    [Serializable]
+    public class LiveLinkLightState
+    {
+        public bool enabled;
+        public float intensity;
+        public Color color;
+        public float range;
+        public float spotAngle;
+    }
+
+    public static class LiveLinkLightStateValidator
+    {
+        public static bool TryValidate(
+            LiveLinkLightState state,
+            out string error)
+        {
+            error = null;
+
+            if (state == null)
+            {
+                error = "Light state is missing.";
+                return false;
+            }
+
+            if (!IsFinite(state.intensity) || state.intensity < 0f)
+            {
+                error = "Light intensity must be finite and non-negative.";
+                return false;
+            }
+
+            if (!IsFinite(state.range) || state.range <= 0f)
+            {
+                error = "Light range must be finite and greater than zero.";
+                return false;
+            }
+
+            if (!IsFinite(state.spotAngle) ||
+                state.spotAngle < 1f || state.spotAngle > 179f)
+            {
+                error = "Spot angle must be between 1 and 179 degrees.";
+                return false;
+            }
+
+            if (!IsFinite(state.color.r) ||
+                !IsFinite(state.color.g) ||
+                !IsFinite(state.color.b) ||
+                !IsFinite(state.color.a))
+            {
+                error = "Light color must contain finite values.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
     }
 }

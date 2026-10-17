@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using LiveLink.Diagnostics;
 
 namespace LiveLink
 {
@@ -25,6 +26,7 @@ namespace LiveLink
         private bool transformAuthorizationGranted;
         private bool authenticationGranted;
         private string pendingAuthenticationChallenge;
+        private string diagnosticSessionId;
 
         internal static void Start()
         {
@@ -53,6 +55,8 @@ namespace LiveLink
         {
             while (pendingCommands.TryDequeue(out string json))
                 HandleCommand(json);
+            foreach (string report in LiveLinkDiagnostics.DrainReports())
+                Debug.Log("[LiveLink Diagnostic]" + Environment.NewLine + report);
         }
 
         private void DiscoveryLoop()
@@ -71,6 +75,16 @@ namespace LiveLink
                             IPAddress.Any, 0);
                         byte[] data = udp.Receive(ref endpoint);
                         string announcement = Encoding.UTF8.GetString(data);
+                        string sessionId = "player-" + Guid.NewGuid().ToString("N");
+                        diagnosticSessionId = LiveLinkDiagnostics.BeginSession(
+                            LiveLinkDiagnosticRole.Player,
+                            LiveLinkDiagnosticTransport.DiscoveryTcp,
+                            sessionId,
+                            endpoint == null ? "UDP discovery" : endpoint.ToString(),
+                            LiveLinkDiagnosticRecordKind.LiveLinkSession);
+                        LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                            LiveLinkDiagnosticStage.UdpAnnouncementReceived,
+                            "Validated Editor discovery announcement.");
                         TryConnect(announcement);
                     }
                     catch (SocketException)
@@ -125,6 +139,9 @@ namespace LiveLink
                     client = new TcpClient();
                     client.NoDelay = true;
                     client.Connect(address, port);
+                    LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                        LiveLinkDiagnosticStage.TcpConnected,
+                        address + ":" + port);
                     writer = new StreamWriter(client.GetStream(),
                         new UTF8Encoding(false))
                     {
@@ -234,6 +251,14 @@ namespace LiveLink
                         }
                         ApplyTransform(command);
                         break;
+                    case "LIGHT_UPDATE":
+                        if (!authenticationGranted)
+                        {
+                            SendReply("ERROR", "TCP authentication required.", null, command.requestId);
+                            break;
+                        }
+                        ApplyLight(command);
+                        break;
                     default:
                         SendReply("ERROR", "Unknown command");
                         break;
@@ -299,6 +324,9 @@ namespace LiveLink
             else
             {
                 Debug.Log("[LiveLink] TCP authentication accepted by Editor.");
+                LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                    LiveLinkDiagnosticStage.HmacAuthenticated,
+                    "Editor accepted the Player proof for this session.");
             }
         }
 
@@ -317,6 +345,14 @@ namespace LiveLink
                     StringComparison.OrdinalIgnoreCase);
 
             transformAuthorizationGranted = authorized;
+            if (authorized)
+                LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                    LiveLinkDiagnosticStage.ManifestCompatible,
+                    "Editor fingerprint matches the baked Player manifest.");
+            else
+                LiveLinkDiagnostics.Fail(diagnosticSessionId,
+                    LiveLinkDiagnosticStage.ManifestCompatible,
+                    "Editor and Player identity manifests differ. Rebuild required.");
             SendReply(
                 authorized ? "OK" : "ERROR",
                 authorized
@@ -384,6 +420,64 @@ namespace LiveLink
             target.localScale = command.scale;
             SendReply("OK", "Updated: " + command.objectId,
                 null, command.requestId);
+            LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                LiveLinkDiagnosticStage.TransformCommandAcknowledged,
+                "TRANSFORM applied by the Player.");
+        }
+
+        private void ApplyLight(LiveLinkCommand command)
+        {
+            if (!transformAuthorizationGranted)
+            {
+                SendReply("ERROR",
+                    "Light synchronization is not authorized for this build.",
+                    null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkLightStateValidator.TryValidate(
+                    command.light, out string validationError))
+            {
+                SendReply("ERROR", validationError, null, command.requestId);
+                return;
+            }
+
+            if (!LiveLinkObjectRegistry.TryGet(
+                    command.objectId, out LiveLinkIdentity identity,
+                    out string error))
+            {
+                SendReply("ERROR", error);
+                return;
+            }
+
+            Light[] lights = identity.GetComponents<Light>();
+            if (command.lightComponentIndex < 0 ||
+                command.lightComponentIndex >= lights.Length)
+            {
+                SendReply("ERROR", "Light component index is invalid.",
+                    null, command.requestId);
+                return;
+            }
+
+            Light target = lights[command.lightComponentIndex];
+            target.enabled = command.light.enabled;
+            target.intensity = command.light.intensity;
+            target.color = command.light.color;
+
+            if (target.type == LightType.Point ||
+                target.type == LightType.Spot)
+            {
+                target.range = command.light.range;
+            }
+
+            if (target.type == LightType.Spot)
+                target.spotAngle = command.light.spotAngle;
+
+            SendReply("OK", "Updated Light: " + command.objectId,
+                null, command.requestId);
+            LiveLinkDiagnostics.Pass(diagnosticSessionId,
+                LiveLinkDiagnosticStage.LightCommandAcknowledged,
+                "LIGHT_UPDATE applied by the Player.");
         }
 
         private void SendReply(
